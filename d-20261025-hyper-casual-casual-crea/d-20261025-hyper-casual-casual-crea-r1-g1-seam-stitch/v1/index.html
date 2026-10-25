@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Seam Stitch</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#151010;overflow:hidden;
+    touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  #c{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   SEAM STITCH - prototype v1
+   Single-file HTML5 canvas game. Logical resolution 390x844 (portrait),
+   scaled to fit and letterboxed.
+   States: title -> play -> flip -> play (next patch) ... -> snap -> over
+   ===================================================================== */
+
+// ---------- Layout constants (logical px) ----------
+const W = 390, H = 844;
+const HUD_H = 84;            // top HUD band
+const FAB_TOP = 84;          // fabric strip top
+const FAB_BOT = 664;         // fabric strip bottom (thumb pad below)
+const NEEDLE_Y = 300;        // needle punches the fabric at this screen Y
+const PAD_Y = 754;           // centre of thumb pad
+const FAST_LIMIT = 1000;     // needle lateral speed (px/s) that counts as a jerk
+
+// ---------- Canvas / scaling ----------
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let scale = 1, dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width = (W * scale) + 'px';
+  cv.style.height = (H * scale) + 'px';
+  cv.width = Math.round(W * scale * dpr);
+  cv.height = Math.round(H * scale * dpr);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Helpers ----------
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function mixHex(a, b, t) {
+  const A = hexToRgb(a), B = hexToRgb(b);
+  return 'rgb(' + Math.round(lerp(A[0], B[0], t)) + ',' + Math.round(lerp(A[1], B[1], t)) + ',' + Math.round(lerp(A[2], B[2], t)) + ')';
+}
+function rrect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.lineTo(x + w - r, y); g.quadraticCurveTo(x + w, y, x + w, y + r);
+  g.lineTo(x + w, y + h - r); g.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  g.lineTo(x + r, y + h); g.quadraticCurveTo(x, y + h, x, y + h - r);
+  g.lineTo(x, y + r); g.quadraticCurveTo(x, y, x + r, y); g.closePath();
+}
+function text(str, x, y, size, col, align, weight) {
+  ctx.font = (weight || '800') + ' ' + size + 'px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = col;
+  ctx.fillText(str, x, y);
+}
+
+// ---------- Pixel pictures (12x12) ----------
+const PIC_COLORS = {
+  o: '#ff8a2a', w: '#fff6ea', K: '#1d1d24', r: '#ff5a4e', b: '#8fd3ff',
+  g: '#62d26f', d: '#2f9a48', p: '#ff8fc0', n: '#c77a43', y: '#ffd43b'
+};
+const PICS = [
+  { name: 'Fox', rows: [
+    '............',
+    '.o........o.',
+    '.oo......oo.',
+    '.ooo....ooo.',
+    '.oooooooooo.',
+    '.ooKooooKoo.',
+    '.oooooooooo.',
+    '.wwooooooww.',
+    '..wwwKKwww..',
+    '...wwwwww...',
+    '....wwww....',
+    '............']},
+  { name: 'Koi', rows: [
+    '............',
+    '............',
+    '...rrrr.....',
+    '.rrwwrrr..rr',
+    'rKrrrwwrrrr.',
+    'rrrrrrwwrrr.',
+    'rrwwrrrrrrr.',
+    '.rrrwwrrr.rr',
+    '...rrrr....r',
+    '............',
+    '.b..b...b..b',
+    '............']},
+  { name: 'Cactus', rows: [
+    '.....pp.....',
+    '....gggg....',
+    '....gdgg....',
+    '.g..gggg..g.',
+    '.g..gdgg..g.',
+    '.gggggggggg.',
+    '....gdgg....',
+    '....gggg....',
+    '..nnnnnnnn..',
+    '..nnyynnnn..',
+    '...nnnnnn...',
+    '............']}
+];
+PICS.forEach(p => { let c = 0; p.rows.forEach(r => { for (const ch of r) if (ch !== '.') c++; }); p.count = c; });
+
+const FABRICS = ['#f4e8d2', '#dcebf7', '#f7dde4'];   // play-side cloth colours
+const BACKS = ['#2f4f7a', '#245e6e', '#5a3d6b'];     // embroidered back-side colours
+const Q_COL = ['#ff4d4d', '#4dabf7', '#ffb300'];      // miss, good, perfect thread colours
+
+/* Draw an embroidered picture. res = per-stitch results (q:0 miss,1 good,2 perfect).
+   Pixels are assigned to stitches in reading order, so each stitch "sews" a slice. */
+function drawPicture(g, x, y, size, picIdx, res, back) {
+  const pic = PICS[picIdx];
+  g.save();
+  g.fillStyle = back;
+  rrect(g, x, y, size, size, size * 0.06); g.fill();
+  // stitched border
+  g.strokeStyle = 'rgba(255,255,255,0.45)';
+  g.lineWidth = Math.max(1, size * 0.012);
+  g.setLineDash([size * 0.035, size * 0.025]);
+  const ins = size * 0.045;
+  g.strokeRect(x + ins, y + ins, size - ins * 2, size - ins * 2);
+  g.setLineDash([]);
+  const pad = size * 0.1, cell = (size - pad * 2) / 12;
+  const M = res && res.length ? res.length : 0;
+  let j = 0;
+  for (let r = 0; r < 12; r++) {
+    const row = pic.rows[r];
+    for (let c = 0; c < 12; c++) {
+      const ch = row[c];
+      if (ch === '.') continue;
+      const q = M ? res[Math.min(M - 1, Math.floor(j * M / pic.count))].q : 2;
+      j++;
+      const px = x + pad + c * cell, py = y + pad + r * cell;
+      const base = PIC_COLORS[ch] || '#ffffff';
+      if (q === 0) {
+        // missed stitch: faint unfinished outline
+        g.strokeStyle = 'rgba(255,255,255,0.22)';
+        g.lineWidth = Math.max(1, cell * 0.1);
+        g.strokeRect(px + cell * 0.2, py + cell * 0.2, cell * 0.6, cell * 0.6);
+        continue;
+      }
+      g.fillStyle = q === 2 ? base : mixHex(base, back, 0.5);
+      g.fillRect(px + cell * 0.06, py + cell * 0.06, cell * 0.88, cell * 0.88);
+      // cross-stitch texture
+      g.strokeStyle = q === 2 ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.12)';
+      g.lineWidth = Math.max(0.7, cell * 0.11);
+      g.beginPath();
+      g.moveTo(px + cell * 0.2, py + cell * 0.2); g.lineTo(px + cell * 0.8, py + cell * 0.8);
+      g.moveTo(px + cell * 0.8, py + cell * 0.2); g.lineTo(px + cell * 0.2, py + cell * 0.8);
+      g.stroke();
+    }
+  }
+  g.restore();
+}
+
+// Front of a finished patch: the cloth with the seam you actually sewed.
+function drawPatchFront(g, x, y, size, patch) {
+  g.save();
+  g.fillStyle = patch.fab;
+  rrect(g, x, y, size, size, size * 0.06); g.fill();
+  g.strokeStyle = 'rgba(0,0,0,0.12)'; g.lineWidth = 1;
+  for (let i = 6; i < size; i += 6) { g.beginPath(); g.moveTo(x + i, y + 2); g.lineTo(x + i, y + size - 2); g.stroke(); }
+  const res = patch.res, n = res.length;
+  if (n > 1) {
+    g.lineWidth = Math.max(2, size * 0.018); g.lineCap = 'round';
+    for (let i = 1; i < n; i++) {
+      const a = res[i - 1], b = res[i];
+      g.strokeStyle = Q_COL[b.q];
+      g.beginPath();
+      g.moveTo(x + size * (0.1 + 0.8 * a.x / W), y + size * (0.08 + 0.84 * (i - 1) / (n - 1)));
+      g.lineTo(x + size * (0.1 + 0.8 * b.x / W), y + size * (0.08 + 0.84 * i / (n - 1)));
+      g.stroke();
+    }
+  }
+  g.restore();
+}
+
+// ---------- Fabric patterns (cached) ----------
+const patternCache = {};
+function fabricPattern(col) {
+  if (patternCache[col]) return patternCache[col];
+  const t = document.createElement('canvas'); t.width = t.height = 32;
+  const g = t.getContext('2d');
+  g.fillStyle = col; g.fillRect(0, 0, 32, 32);
+  g.globalAlpha = 0.07; g.fillStyle = '#000';
+  for (let i = 0; i < 32; i += 4) { g.fillRect(i, 0, 1, 32); g.fillRect(0, i + 2, 32, 1); }
+  g.globalAlpha = 0.18; g.fillStyle = '#fff';
+  for (let i = 2; i < 32; i += 4) g.fillRect(i, 0, 1, 32);
+  return (patternCache[col] = ctx.createPattern(t, 'repeat'));
+}
+
+// ---------- Audio (WebAudio, synthesized, created on first tap) ----------
+let AC = null, noiseBuf = null;
+function initAudio() {
+  try {
+    if (!AC) {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) return;
+      AC = new C();
+      noiseBuf = AC.createBuffer(1, Math.floor(AC.sampleRate * 0.3), AC.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f, dur, type, vol, f2, delay) {
+  if (!AC) return;
+  try {
+    const t0 = AC.currentTime + (delay || 0);
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f, t0);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+    g.gain.setValueAtTime(vol || 0.1, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  } catch (e) { /* ignore */ }
+}
+function noise(dur, vol, freq, type) {
+  if (!AC || !noiseBuf) return;
+  try {
+    const t0 = AC.currentTime;
+    const s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+    s.buffer = noiseBuf; f.type = type || 'bandpass'; f.frequency.value = freq || 1800;
+    g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(f); f.connect(g); g.connect(AC.destination);
+    s.start(t0); s.stop(t0 + dur + 0.02);
+  } catch (e) { /* ignore */ }
+}
+const sfx = {
+  thk() { noise(0.045, 0.35, 2200); tone(190, 0.06, 'sine', 0.18, 70); },
+  perfect(m) { tone(780 * (1 + Math.min(streak, 12) * 0.045), 0.14, 'triangle', 0.12); },
+  good() { tone(520, 0.08, 'triangle', 0.08); },
+  miss() { tone(150, 0.22, 'sawtooth', 0.09, 80); },
+  snap() { noise(0.2, 0.4, 3000, 'highpass'); tone(700, 0.35, 'square', 0.06, 50); },
+  flip() { [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.22, 'triangle', 0.09, 0, i * 0.08)); },
+  combo() { tone(1046, 0.1, 'sine', 0.08, 0, 0); tone(1568, 0.16, 'sine', 0.07, 0, 0.06); }
+};
+
+// ---------- Object pools: particles and floating text ----------
+const parts = [];
+for (let i = 0; i < 90; i++) parts.push({ on: false });
+function spawnPart(x, y, vx, vy, life, size, col, grow) {
+  for (const p of parts) if (!p.on) {
+    p.on = true; p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.life = p.max = life;
+    p.size = size; p.col = col; p.grow = grow || 0; return;
+  }
+}
+function puff(x, y, q) {
+  for (let i = 0; i < 7; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 30 + Math.random() * 60;
+    spawnPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp - 20, 0.45, 3 + Math.random() * 3, 'rgba(255,255,255,0.9)', 10);
+  }
+  if (q === 2) for (let i = 0; i < 8; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 90 + Math.random() * 110;
+    spawnPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp, 0.5, 2.5, '#ffd43b', -3);
+  }
+  if (q === 0) for (let i = 0; i < 6; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 80;
+    spawnPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp, 0.4, 2.5, '#ff4d4d', -2);
+  }
+}
+const pops = [];
+for (let i = 0; i < 12; i++) pops.push({ on: false });
+function popText(str, x, y, col, size) {
+  let p = pops.find(o => !o.on) || pops[0];
+  p.on = true; p.str = str; p.x = x; p.y = y; p.col = col; p.size = size || 22; p.life = p.max = 0.8;
+}
+
+// ---------- Game state ----------
+let state = 'title', stateT = 0, time = 0;
+let P = null;               // current patch
+let scroll = 0;             // fabric distance travelled past the needle
+let nextMark = 0;           // index of next stitch mark to judge
+let needleX = W / 2, targetX = W / 2, vel = 0, holding = false;
+let score = 0, streak = 0, misses = 0, best = 0;
+let quilt = [];             // finished patches: {canvas, name}
+let tug = 0, shake = 0, bob = 0, banner = 0, spoolGlow = 0;
+let flipCanvas = null;
+try { best = parseInt(localStorage.getItem('seamStitchBest') || '0', 10) || 0; } catch (e) { best = 0; }
+
+/* Build patch n. Difficulty ramps with n: faster scroll, wider/tighter curves,
+   slightly smaller perfect window. Patch 1 lasts ~26 s. */
+function makePatch(n) {
+  const k = n - 1;
+  const p = {
+    n, speed: Math.min(115 + 32 * k, 260),
+    count: Math.min(28 + 4 * k, 40),
+    spacing: 95 + 4 * Math.min(k, 3),
+    start: 330,
+    A: Math.min(62 + 28 * k, 120), w1: 0.0042 + 0.0013 * k,
+    B: Math.min(16 + 12 * k, 45), w2: 0.010 + 0.003 * k,
+    ph: Math.random() * 6.28, ph2: Math.random() * 6.28,
+    perfR: Math.max(12 - k, 8), goodR: Math.max(28 - 2 * k, 20),
+    pic: k % PICS.length, fab: FABRICS[k % FABRICS.length], back: BACKS[k % BACKS.length],
+    marks: [], res: []
+  };
+  for (let i = 0; i < p.count; i++) p.marks.push(p.start + i * p.spacing);
+  p.end = p.marks[p.count - 1] + 140;
+  return p;
+}
+// Seam guide X at fabric distance s (starts straight in the centre, then weaves).
+function seamX(p, s) {
+  const r = clamp((s - 120) / 260, 0, 1);
+  return clamp(W / 2 + r * (p.A * Math.sin(s * p.w1 + p.ph) + p.B * Math.sin(s * p.w2 + p.ph2)), 48, W - 48);
+}
+const mult = () => streak >= 8 ? 5 : streak >= 4 ? 3 : streak >= 2 ? 2 : 1;
+const MULT_COL = { 1: '#e9e2d6', 2: '#4dabf7', 3: '#ffb300', 5: '#ff5fa2' };
+
+function startRun() {
+  score = 0; streak = 0; quilt = [];
+  startPatch(1);
+}
+function startPatch(n) {
+  P = makePatch(n);
+  scroll = 0; nextMark = 0; misses = 0; tug = 0; vel = 0;
+  state = 'play'; stateT = 0; banner = 2.4;
+}
+
+function judge(i) {
+  const s = P.marks[i], mx = seamX(P, s), dx = Math.abs(needleX - mx);
+  const fast = Math.abs(vel) > FAST_LIMIT;
+  const q = fast ? 0 : dx <= P.perfR ? 2 : dx <= P.goodR ? 1 : 0;
+  P.res.push({ q, x: needleX, s });
+  bob = 1;
+  sfx.thk();
+  puff(needleX, NEEDLE_Y, q);
+  if (q === 2) {
+    const before = mult();
+    streak++;
+    const m = mult();
+    score += 100 * m;
+    popText('Perfect!' + (m > 1 ? ' x' + m : ''), needleX, NEEDLE_Y - 60, '#ffb300', 22);
+    sfx.perfect();
+    if (m > before) { spoolGlow = 1; sfx.combo(); popText('x' + m + ' COMBO', 112, PAD_Y - 64, MULT_COL[m], 20); }
+  } else if (q === 1) {
+    score += 40 * mult();
+    popText('Good', needleX, NEEDLE_Y - 60, '#4dabf7', 20);
+    sfx.good();
+  } else {
+    streak = 0; misses++; tug = 0.55; shake = 0.3;
+    popText(fast ? 'Too fast!' : 'Miss', needleX, NEEDLE_Y - 60, '#ff4d4d', 22);
+    sfx.miss();
+    if (misses >= 3) { state = 'snap'; stateT = 0; shake = 0.5; sfx.snap(); }
+  }
+}
+
+function finishPatch() {
+  state = 'flip'; stateT = 0;
+  // pre-render the embroidered result for the quilt
+  flipCanvas = document.createElement('canvas');
+  flipCanvas.width = flipCanvas.height = 160;
+  drawPicture(flipCanvas.getContext('2d'), 0, 0, 160, P.pic, P.res, P.back);
+  sfx.flip();
+}
+
+function endRun() {
+  state = 'over'; stateT = 0;
+  if (score > best) { best = score; try { localStorage.setItem('seamStitchBest', String(best)); } catch (e) { /* ignore */ } }
+}
+
+// ---------- Input (pointer events: touch + mouse) ----------
+function toLocal(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  initAudio();
+  try { cv.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+  const p = toLocal(e);
+  holding = true;
+  targetX = clamp(p.x, 30, W - 30);
+  if (state === 'title') { startRun(); }
+  else if (state === 'flip' && stateT > 1.5 && stateT < 3.0) { stateT = 3.0; }
+  else if (state === 'over' && stateT > 0.7) { startRun(); }
+});
+cv.addEventListener('pointermove', e => {
+  if (!holding) return;
+  e.preventDefault();
+  targetX = clamp(toLocal(e).x, 30, W - 30);
+});
+const release = () => { holding = false; };
+cv.addEventListener('pointerup', release);
+cv.addEventListener('pointercancel', release);
+cv.addEventListener('lostpointercapture', release);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---------- Update ----------
+function update(dt) {
+  time += dt; stateT += dt;
+  tug = Math.max(0, tug - dt); shake = Math.max(0, shake - dt);
+  bob = Math.max(0, bob - dt * 6); banner = Math.max(0, banner - dt);
+  spoolGlow = Math.max(0, spoolGlow - dt * 1.5);
+
+  if (state === 'title') {
+    // attract mode: fabric drifts, needle follows the guide by itself
+    if (!P) P = makePatch(1);
+    scroll += 60 * dt;
+    if (scroll > P.end) scroll = 0;
+    needleX = seamX(P, scroll);
+  } else if (state === 'play') {
+    const prev = needleX;
+    needleX += (targetX - needleX) * Math.min(1, dt * 16);   // slight lag
+    const v = (needleX - prev) / Math.max(dt, 0.001);
+    vel += (v - vel) * Math.min(1, dt * 20);
+    scroll += P.speed * dt;
+    while (state === 'play' && nextMark < P.count && P.marks[nextMark] <= scroll) judge(nextMark++);
+    if (state === 'play' && nextMark >= P.count && scroll >= P.end) finishPatch();
+  } else if (state === 'flip') {
+    if (stateT >= 3.6) {
+      quilt.push({ canvas: flipCanvas, name: PICS[P.pic].name });
+      startPatch(P.n + 1);
+    }
+  } else if (state === 'snap') {
+    if (stateT > 1.1) endRun();
+  }
+
+  for (const p of parts) if (p.on) {
+    p.life -= dt; if (p.life <= 0) { p.on = false; continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.92; p.vy *= 0.92;
+    p.size = Math.max(0.5, p.size + p.grow * dt);
+  }
+  for (const p of pops) if (p.on) { p.life -= dt; p.y -= 40 * dt; if (p.life <= 0) p.on = false; }
+}
+
+// ---------- Rendering ----------
+const fy = s => NEEDLE_Y + (s - scroll);     // fabric distance -> screen Y
+
+function drawFabric() {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, FAB_TOP, W, FAB_BOT - FAB_TOP); ctx.clip();
+  ctx.save();
+  ctx.translate(0, -(scroll % 32));
+  ctx.fillStyle = fabricPattern(P.fab);
+  ctx.fillRect(0, FAB_TOP - 32, W, FAB_BOT - FAB_TOP + 64);
+  ctx.restore();
+  // selvedge stitching on both edges
+  ctx.strokeStyle = 'rgba(120,90,70,0.35)'; ctx.lineWidth = 2;
+  ctx.setLineDash([10, 8]); ctx.lineDashOffset = scroll;
+  ctx.beginPath(); ctx.moveTo(14, FAB_TOP); ctx.lineTo(14, FAB_BOT); ctx.moveTo(W - 14, FAB_TOP); ctx.lineTo(W - 14, FAB_BOT); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // seam guide (dotted): faint behind the needle, stronger ahead
+  const s0 = scroll - (NEEDLE_Y - FAB_TOP) - 10, s1 = scroll + (FAB_BOT - NEEDLE_Y) + 10;
+  ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.setLineDash([2, 9]);
+  ctx.strokeStyle = 'rgba(90,70,60,0.22)';
+  ctx.beginPath();
+  for (let s = Math.max(0, s0); s <= scroll; s += 8) { const y = fy(s), x = seamX(P, s); s === Math.max(0, s0) ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(90,70,60,0.6)';
+  ctx.beginPath();
+  let first = true;
+  for (let s = Math.max(0, scroll); s <= Math.min(s1, P.end); s += 8) { const y = fy(s), x = seamX(P, s); first ? ctx.moveTo(x, y) : ctx.lineTo(x, y); first = false; }
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // upcoming stitch marks
+  for (let i = P.count - 1; i >= nextMark; i--) {
+    const s = P.marks[i], y = fy(s);
+    if (y > FAB_BOT + 20) continue;
+    const x = seamX(P, s);
+    if (i === nextMark && state === 'play') {
+      const pulse = 1 + Math.sin(time * 10) * 0.08;
+      ctx.fillStyle = 'rgba(77,171,247,0.12)';
+      ctx.beginPath(); ctx.arc(x, y, P.goodR * pulse, 0, 6.283); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,179,0,0.9)'; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(x, y, P.perfR * pulse, 0, 6.283); ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(70,50,45,0.75)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x - 5, y - 5); ctx.lineTo(x + 5, y + 5); ctx.moveTo(x + 5, y - 5); ctx.lineTo(x - 5, y + 5); ctx.stroke();
+  }
+
+  // sewn thread: running stitch between actual stitch points
+  const res = P.res;
+  ctx.lineCap = 'round';
+  for (let i = 0; i < res.length; i++) {
+    const b = res[i], yb = fy(b.s);
+    if (yb < FAB_TOP - 120) continue;
+    if (i > 0) {
+      const a = res[i - 1];
+      ctx.strokeStyle = Q_COL[b.q]; ctx.lineWidth = 4;
+      if (b.q === 0) ctx.setLineDash([6, 6]);
+      ctx.beginPath(); ctx.moveTo(a.x, fy(a.s)); ctx.lineTo(b.x, yb); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.fillStyle = 'rgba(60,40,35,0.6)';
+    ctx.beginPath(); ctx.arc(b.x, yb, 2.6, 0, 6.283); ctx.fill();
+  }
+  ctx.restore();
+
+  // soft shadow under HUD and above pad
+  let g = ctx.createLinearGradient(0, FAB_TOP, 0, FAB_TOP + 24);
+  g.addColorStop(0, 'rgba(0,0,0,0.3)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, FAB_TOP, W, 24);
+  g = ctx.createLinearGradient(0, FAB_BOT - 24, 0, FAB_BOT);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.25)');
+  ctx.fillStyle = g; ctx.fillRect(0, FAB_BOT - 24, W, 24);
+}
+
+function drawNeedle() {
+  const wob = tug > 0 ? Math.sin(time * 70) * 4 * tug : 0;
+  const x = needleX + wob, y = NEEDLE_Y + bob * 7;
+  const ang = clamp(vel / 1600, -0.45, 0.45);
+  // eye position in world space (needle rotated around its tip)
+  const ex = x - Math.sin(ang) * 40, ey = y - Math.cos(ang) * 40;
+  // thread from the last stitch to the needle eye
+  const last = P.res.length ? P.res[P.res.length - 1] : null;
+  const lx = last ? last.x : seamX(P, Math.max(0, scroll - 200)), ly = last ? fy(last.s) : FAB_TOP;
+  ctx.strokeStyle = tug > 0 ? '#ff4d4d' : MULT_COL[mult()];
+  ctx.lineWidth = tug > 0 ? 3.5 : 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(lx, ly);
+  ctx.quadraticCurveTo((lx + ex) / 2 + 18, Math.min(ly, ey) - 20, ex, ey); ctx.stroke();
+  // target dot on the cloth
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath(); ctx.ellipse(x + 4, NEEDLE_Y + 3, 9, 4, 0, 0, 6.283); ctx.fill();
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(-ang);
+  const g = ctx.createLinearGradient(-4, 0, 4, 0);
+  g.addColorStop(0, '#8e98a6'); g.addColorStop(0.5, '#ffffff'); g.addColorStop(1, '#7a8492');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(0, 2); ctx.lineTo(-3.2, -10); ctx.lineTo(-3.2, -46); ctx.quadraticCurveTo(0, -52, 3.2, -46); ctx.lineTo(3.2, -10); ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(40,40,50,0.5)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = '#2a2020';
+  ctx.beginPath(); ctx.ellipse(0, -40, 1.3, 4, 0, 0, 6.283); ctx.fill();
+  ctx.restore();
+}
+
+function drawThreadIcon(x, y, ok) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = '#8a6a50'; ctx.fillRect(-10, -13, 20, 4); ctx.fillRect(-10, 9, 20, 4);
+  ctx.fillStyle = ok ? '#ffb300' : '#4a3a35';
+  ctx.fillRect(-7, -9, 14, 18);
+  if (ok) {
+    ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 1;
+    for (let i = -6; i < 9; i += 3) { ctx.beginPath(); ctx.moveTo(-7, i); ctx.lineTo(7, i + 1); ctx.stroke(); }
+  } else {
+    ctx.strokeStyle = '#ff4d4d'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-9, -9); ctx.lineTo(9, 9); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function quiltSlot(i) { return { x: 300 + (i % 3) * 29, y: 14 + Math.floor(i / 3) * 29, s: 26 }; }
+
+function drawHUD() {
+  ctx.fillStyle = '#2a2020'; ctx.fillRect(0, 0, W, HUD_H);
+  text(score.toLocaleString(), 16, 32, 30, '#fff6ea', 'left', '900');
+  text('PATCH ' + (P ? P.n : 1) + '   BEST ' + best.toLocaleString(), 16, 60, 12, '#b9a796', 'left', '700');
+  // thread icons (lives)
+  for (let i = 0; i < 3; i++) drawThreadIcon(178 + i * 32, 34, i < 3 - misses);
+  // progress
+  if (P) {
+    ctx.fillStyle = 'rgba(255,255,255,0.1)'; rrect(ctx, 150, 58, 128, 6, 3); ctx.fill();
+    ctx.fillStyle = '#ffb300'; rrect(ctx, 150, 58, Math.max(6, 128 * nextMark / P.count), 6, 3); ctx.fill();
+  }
+  // mini quilt (last 6 patches)
+  const show = quilt.slice(-6);
+  for (let i = 0; i < 6; i++) {
+    const q = quiltSlot(i);
+    if (show[i]) ctx.drawImage(show[i].canvas, q.x, q.y, q.s, q.s);
+    else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+      ctx.strokeRect(q.x + 0.5, q.y + 0.5, q.s - 1, q.s - 1); ctx.setLineDash([]);
+    }
+  }
+}
+
+function drawPad() {
+  ctx.fillStyle = '#2a2020'; ctx.fillRect(0, FAB_BOT, W, H - FAB_BOT);
+  ctx.fillStyle = '#332828'; rrect(ctx, 12, FAB_BOT + 14, W - 24, H - FAB_BOT - 34, 22); ctx.fill();
+  // spool with combo multiplier
+  const m = mult(), col = MULT_COL[m];
+  const sx = 70, sy = PAD_Y;
+  ctx.save();
+  if (m >= 3 || spoolGlow > 0) { ctx.shadowColor = col; ctx.shadowBlur = 18 + spoolGlow * 30 + Math.sin(time * 8) * 4; }
+  ctx.fillStyle = '#9a7a5c'; rrect(ctx, sx - 40, sy - 46, 80, 12, 5); ctx.fill(); rrect(ctx, sx - 40, sy + 34, 80, 12, 5); ctx.fill();
+  ctx.fillStyle = col; ctx.fillRect(sx - 32, sy - 34, 64, 68);
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 1.5;
+  for (let i = -30; i < 34; i += 5) { ctx.beginPath(); ctx.moveTo(sx - 32, sy + i); ctx.lineTo(sx + 32, sy + i + 2); ctx.stroke(); }
+  const pop = 1 + spoolGlow * 0.35;
+  text('x' + m, sx, sy + 1, 30 * pop, m === 1 ? '#5a4a40' : '#1d1414', 'center', '900');
+  text(streak > 0 ? 'STREAK ' + streak : 'COMBO', sx, sy + 60, 11, '#b9a796', 'center', '800');
+  // drag hint / finger marker
+  if (state === 'play' || state === 'title') {
+    if (holding && state === 'play') {
+      ctx.fillStyle = 'rgba(255,246,234,0.18)';
+      ctx.beginPath(); ctx.arc(targetX, sy, 30, 0, 6.283); ctx.fill();
+      ctx.fillStyle = 'rgba(255,246,234,0.6)';
+      ctx.beginPath(); ctx.arc(targetX, sy, 10, 0, 6.283); ctx.fill();
+    } else {
+      const a = 0.45 + Math.sin(time * 4) * 0.25;
+      text('◀  HOLD & DRAG  ▶', 250, sy, 15, 'rgba(255,246,234,' + a.toFixed(2) + ')', 'center', '800');
+    }
+  }
+}
+
+function drawPops() {
+  for (const p of parts) if (p.on) {
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const p of pops) if (p.on) {
+    const t = p.life / p.max;
+    ctx.globalAlpha = clamp(t * 1.6, 0, 1);
+    ctx.save(); ctx.translate(p.x, p.y);
+    const s = 1 + (1 - t < 0.15 ? (0.15 - (1 - t)) * 3 : 0);
+    ctx.scale(s, s);
+    ctx.font = '900 ' + p.size + 'px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(30,20,20,0.75)'; ctx.strokeText(p.str, 0, 0);
+    ctx.fillStyle = p.col; ctx.fillText(p.str, 0, 0);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function dim(a) { ctx.fillStyle = 'rgba(20,12,12,' + a + ')'; ctx.fillRect(0, 0, W, H); }
+
+function drawTitle() {
+  dim(0.55);
+  ctx.fillStyle = 'rgba(42,32,32,0.95)'; rrect(ctx, 30, 150, W - 60, 430, 26); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,179,0,0.6)'; ctx.setLineDash([8, 6]); ctx.lineWidth = 2;
+  rrect(ctx, 40, 160, W - 80, 410, 20); ctx.stroke(); ctx.setLineDash([]);
+  text('SEAM', W / 2, 218, 54, '#fff6ea', 'center', '900');
+  text('STITCH', W / 2, 270, 54, '#ffb300', 'center', '900');
+  for (let i = 0; i < 3; i++) drawPicture(ctx, 70 + i * 90, 310, 70, i, null, BACKS[i]);
+  text('Hold & drag the needle along the seam.', W / 2, 418, 15, '#e9e2d6', 'center', '700');
+  text('Hit marks dead-centre for Perfect + combo.', W / 2, 442, 15, '#e9e2d6', 'center', '700');
+  text('Finish the patch to reveal your embroidery!', W / 2, 466, 15, '#e9e2d6', 'center', '700');
+  const a = 0.6 + Math.sin(time * 5) * 0.4;
+  text('TAP TO START', W / 2, 528, 24, 'rgba(255,179,0,' + a.toFixed(2) + ')', 'center', '900');
+}
+
+function drawFlip() {
+  const t = stateT;
+  dim(Math.min(0.6, t * 1.5));
+  const cx0 = W / 2, cy0 = 380, s0 = 250;
+  let cx = cx0, cy = cy0, size = s0, sx = 1, back = false;
+  if (t < 0.4) { const k = easeOut(t / 0.4); size = s0 * (0.6 + 0.4 * k); }
+  else if (t < 1.2) { const k = (t - 0.4) / 0.8; sx = Math.abs(Math.cos(k * Math.PI)); back = k > 0.5; }
+  else if (t < 3.0) { back = true; }
+  else {
+    back = true;
+    const k = easeOut(clamp((t - 3.0) / 0.6, 0, 1));
+    const q = quiltSlot(Math.min(quilt.length, 5));
+    cx = lerp(cx0, q.x + q.s / 2, k); cy = lerp(cy0, q.y + q.s / 2, k); size = lerp(s0, q.s, k);
+  }
+  ctx.save();
+  ctx.translate(cx, cy); ctx.scale(Math.max(0.02, sx), 1);
+  if (back) ctx.drawImage(flipCanvas, -size / 2, -size / 2, size, size);
+  else drawPatchFront(ctx, -size / 2, -size / 2, size, P);
+  ctx.restore();
+  if (t > 1.2 && t < 3.0) {
+    const a = clamp((t - 1.2) * 4, 0, 1);
+    ctx.globalAlpha = a;
+    const res = P.res, pf = res.filter(r => r.q === 2).length, gd = res.filter(r => r.q === 1).length, ms = res.length - pf - gd;
+    text(PICS[P.pic].name + ' embroidered!', W / 2, 200, 28, '#fff6ea', 'center', '900');
+    text(Math.round(pf / res.length * 100) + '% PERFECT', W / 2, 540, 22, '#ffb300', 'center', '900');
+    text('Perfect ' + pf + '   Good ' + gd + '   Miss ' + ms, W / 2, 572, 15, '#e9e2d6', 'center', '700');
+    text('Next: Patch ' + (P.n + 1) + ' - faster, tighter curves', W / 2, 604, 14, '#b9a796', 'center', '700');
+    if (t > 1.5) text('tap to continue', W / 2, 636, 13, 'rgba(233,226,214,0.7)', 'center', '700');
+    ctx.globalAlpha = 1;
+    // sparkles around the card
+    if (Math.random() < 0.4) spawnPart(cx0 + (Math.random() - 0.5) * 280, cy0 + (Math.random() - 0.5) * 280, 0, -20, 0.6, 2.5, '#ffd43b', -2);
+  }
+}
+
+function drawSnap() {
+  dim(Math.min(0.45, stateT));
+  const k = easeOut(clamp(stateT / 0.3, 0, 1));
+  ctx.save(); ctx.translate(W / 2, 380); ctx.scale(0.6 + 0.4 * k, 0.6 + 0.4 * k);
+  text('SNAP!', 0, 0, 64, '#ff4d4d', 'center', '900');
+  ctx.restore();
+  text('The thread broke', W / 2, 430, 18, '#fff6ea', 'center', '800');
+}
+
+function drawOver() {
+  dim(0.7);
+  ctx.fillStyle = 'rgba(42,32,32,0.97)'; rrect(ctx, 26, 110, W - 52, 600, 26); ctx.fill();
+  text('Thread snapped!', W / 2, 160, 32, '#ff6b6b', 'center', '900');
+  text(score.toLocaleString(), W / 2, 220, 48, '#fff6ea', 'center', '900');
+  text((score >= best && score > 0 ? 'NEW BEST!' : 'BEST ' + best.toLocaleString()), W / 2, 262, 15, '#ffb300', 'center', '800');
+  text('YOUR QUILT', W / 2, 306, 14, '#b9a796', 'center', '800');
+  const show = quilt.slice(-6), cs = 92, gap = 8, gx = W / 2 - (cs * 3 + gap * 2) / 2, gy = 326;
+  for (let i = 0; i < 6; i++) {
+    const x = gx + (i % 3) * (cs + gap), y = gy + Math.floor(i / 3) * (cs + gap);
+    if (show[i]) ctx.drawImage(show[i].canvas, x, y, cs, cs);
+    else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.setLineDash([5, 5]); ctx.lineWidth = 1.5;
+      rrect(ctx, x + 1, y + 1, cs - 2, cs - 2, 8); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+  if (!quilt.length) text('Finish a patch to start your quilt', W / 2, gy + cs + gap / 2, 14, '#e9e2d6', 'center', '700');
+  else text(quilt.length + ' patch' + (quilt.length > 1 ? 'es' : '') + ' sewn', W / 2, gy + cs * 2 + gap + 28, 14, '#e9e2d6', 'center', '700');
+  if (stateT > 0.7) {
+    const a = 0.6 + Math.sin(time * 5) * 0.4;
+    text('TAP TO SEW AGAIN', W / 2, 656, 24, 'rgba(255,179,0,' + a.toFixed(2) + ')', 'center', '900');
+  }
+}
+
+function render() {
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+  ctx.fillStyle = '#2a2020'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * 12 * shake, (Math.random() - 0.5) * 12 * shake);
+  drawFabric();
+  if (state !== 'flip') drawNeedle();
+  drawPops();
+  ctx.restore();
+  drawHUD();
+  drawPad();
+  if (state === 'play' && banner > 0) {
+    const a = clamp(banner, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(42,32,32,0.85)'; rrect(ctx, 70, 160, W - 140, 64, 18); ctx.fill();
+    text('PATCH ' + P.n, W / 2, 182, 22, '#fff6ea', 'center', '900');
+    text(P.n === 1 ? 'Follow the dotted seam' : 'Faster! Tighter curves', W / 2, 206, 14, '#ffb300', 'center', '800');
+    ctx.globalAlpha = 1;
+  }
+  if (state === 'title') drawTitle();
+  else if (state === 'flip') drawFlip();
+  else if (state === 'snap') drawSnap();
+  else if (state === 'over') drawOver();
+}
+
+// ---------- Main loop ----------
+// Fixed 120 Hz simulation step: needle smoothing, the "too fast" check and stitch timing
+// give the same result at 30, 60 or 120 fps.
+const STEP = 1 / 120;
+let lastT = 0, acc = 0;
+function frame(ts) {
+  const dt = lastT ? clamp((ts - lastT) / 1000, 0, 0.05) : 0.016;
+  lastT = ts;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+P = makePatch(1);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
