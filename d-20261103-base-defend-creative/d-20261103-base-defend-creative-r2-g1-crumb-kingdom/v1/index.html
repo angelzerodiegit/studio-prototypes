@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Crumb Kingdom</title>
+<style>
+html,body{margin:0;padding:0;height:100%;background:#2a1a10;overflow:hidden;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;touch-action:none;display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+var W = 390, H = 844, CX = 195, CY = 440, R = 76;
+var STEP = 1 / 120, RUN = 75, MAXAMMO = 8, RANGE = 300, FIRE_CD = 0.33;
+var PI = Math.PI, TAU = PI * 2, SL = PI / 4;
+var MAXMICE = 40, MAXB = 48, MAXP = 200, MAXPOP = 24;
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+// ---------- cached strings ----------
+var cakeStr = [], timeStr = [], streakStr = [], scorePopStr = [];
+var i;
+for (i = 0; i <= 8; i++) cakeStr[i] = 'Cake ' + i + '/8';
+for (i = 0; i <= 90; i++) timeStr[i] = i + 's';
+for (i = 1; i <= 5; i++) { streakStr[i] = 'Sweet Streak x' + i; scorePopStr[i] = '+' + (10 * i); }
+var scoreStr = 'Score 0', bestStr = 'Best 0', finalStr = '', bestEndStr = '';
+var FONT_S = 'bold 14px sans-serif', FONT_M = 'bold 18px sans-serif', FONT_L = 'bold 26px sans-serif', FONT_XL = 'bold 40px sans-serif', FONT_POP = 'bold 20px sans-serif';
+var DASH = [6, 6], NODASH = [];
+
+// ---------- scaling ----------
+var vs = 1, vox = 0, voy = 0, dpr = 1, iw = 390, ih = 844;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  iw = window.innerWidth; ih = window.innerHeight;
+  canvas.width = Math.round(iw * dpr); canvas.height = Math.round(ih * dpr);
+  vs = Math.min(iw / W, ih / H);
+  vox = (iw - W * vs) / 2; voy = (ih - H * vs) / 2;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+resize();
+
+// ---------- state ----------
+var slices = new Uint8Array(8), sliceCount = 8, held = -1;
+var dragOn = false, dragX = 0, dragY = 0, dragPid = -1, hoverSpot = -1;
+var spX = [87, 303, 87, 565 - 0], spY = [315, 315, 565, 565];
+spX[3] = 303;
+var spHas = new Uint8Array(4), spAmmo = new Float32Array(4), spCd = new Float32Array(4), spAng = new Float32Array(4), spKick = new Float32Array(4);
+var state = 0; // 0 play, 1 win, 2 lose
+var lastFeed = -99, FEED_WIN = 6;
+var t = 0, endT = 0, score = 0, best = 0, kills = 0, chain = 0, mult = 1, finalScore = 0, newBest = false;
+var shake = 0, spawnT = 0, tut = 0, tutMouse = false, normalOn = false, flashT = 0, bakeT = 0;
+var acc = 0, last = 0;
+try { best = parseInt(localStorage.getItem('crumbKingdomBest') || '0', 10) || 0; } catch (e) { best = 0; }
+bestStr = 'Best ' + best;
+
+function mk(n, f) { var a = [], k; for (k = 0; k < n; k++) a[k] = f(); return a; }
+var mice = mk(MAXMICE, function () { return { on: false, x: 0, y: 0, vx: 0, vy: 0, hp: 1, maxhp: 1, ph: 0, fat: false, sp: 0 }; });
+var bul = mk(MAXB, function () { return { on: false, x: 0, y: 0, vx: 0, vy: 0, life: 0 }; });
+var parts = mk(MAXP, function () { return { on: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, size: 3, col: '#fff' }; });
+var pops = mk(MAXPOP, function () { return { on: false, x: 0, y: 0, age: 0, txt: '', col: '#fff' }; });
+var pi = 0, ppi = 0;
+
+// ---------- audio ----------
+var actx = null;
+function initAudio() {
+  if (actx) { try { if (actx.state === 'suspended') actx.resume(); } catch (e) {} return; }
+  try {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) { actx = new AC(); if (actx.state === 'suspended') actx.resume(); }
+  } catch (e) { actx = null; }
+}
+var lastSnd = 0;
+function tone(f0, f1, dur, type, vol) {
+  if (!actx) return;
+  try {
+    var o = actx.createOscillator(), g = actx.createGain(), n = actx.currentTime;
+    o.type = type; o.frequency.setValueAtTime(f0, n); o.frequency.exponentialRampToValueAtTime(f1, n + dur);
+    g.gain.setValueAtTime(vol, n); g.gain.exponentialRampToValueAtTime(0.0001, n + dur);
+    o.connect(g); g.connect(actx.destination); o.start(n); o.stop(n + dur + 0.02);
+  } catch (e) {}
+}
+
+// ---------- helpers ----------
+var PCOL = ['#fff5e0', '#ffd1e0', '#ffe9a8', '#ff8fb0', '#c9a27a'];
+function burst(x, y, n, speed, col0, size) {
+  for (var k = 0; k < n; k++) {
+    var p = parts[pi]; pi = (pi + 1) % MAXP;
+    var a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.on = true; p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s - 20;
+    p.max = 0.35 + Math.random() * 0.4; p.life = p.max; p.size = size * (0.6 + Math.random() * 0.8);
+    p.col = col0 ? col0 : PCOL[(Math.random() * 4) | 0];
+  }
+}
+function pop(x, y, txt, col) {
+  var p = pops[ppi]; ppi = (ppi + 1) % MAXPOP;
+  p.on = true; p.x = x; p.y = y; p.age = 0; p.txt = txt; p.col = col;
+}
+function setChain(c) {
+  chain = c;
+  var m = 1 + Math.floor(c / 3); if (m > 5) m = 5;
+  mult = m;
+}
+function addScore(v) { score += v; scoreStr = 'Score ' + score; }
+
+function reset() {
+  var k;
+  for (k = 0; k < 8; k++) slices[k] = 1;
+  lastFeed = -99; lastSnd = 0;
+  sliceCount = 8; held = -1; dragOn = false; dragPid = -1; hoverSpot = -1;
+  for (k = 0; k < 4; k++) { spHas[k] = 0; spAmmo[k] = 0; spCd[k] = 0; spAng[k] = -PI / 2; spKick[k] = 0; }
+  for (k = 0; k < MAXMICE; k++) mice[k].on = false;
+  for (k = 0; k < MAXB; k++) bul[k].on = false;
+  for (k = 0; k < MAXP; k++) parts[k].on = false;
+  for (k = 0; k < MAXPOP; k++) pops[k].on = false;
+  state = 0; t = 0; endT = 0; score = 0; kills = 0; setChain(0); newBest = false;
+  scoreStr = 'Score 0'; shake = 0; spawnT = 1.5; tut = 0; tutMouse = false; normalOn = false; flashT = 0; bakeT = 0;
+  acc = 0;
+}
+
+function spawnMouse(slow) {
+  var m = null, k;
+  for (k = 0; k < MAXMICE; k++) if (!mice[k].on) { m = mice[k]; break; }
+  if (!m) return;
+  var x, y, e = slow ? 0 : ((Math.random() * 4) | 0);
+  if (slow) { x = 250; y = 110; }
+  else if (e === 0) { x = 20 + Math.random() * 350; y = 106; }
+  else if (e === 1) { x = -12; y = 150 + Math.random() * 640; }
+  else if (e === 2) { x = W + 12; y = 150 + Math.random() * 640; }
+  else { x = 20 + Math.random() * 350; y = H + 12; }
+  var dx = CX - x, dy = CY - y, d = Math.sqrt(dx * dx + dy * dy);
+  var fat = !slow && t > 25 && Math.random() < 0.25;
+  var sp = slow ? 42 : (36 + t * 0.35 + Math.random() * 14) * (fat ? 0.8 : 1);
+  m.on = true; m.x = x; m.y = y; m.vx = dx / d * sp; m.vy = dy / d * sp; m.sp = sp;
+  m.fat = fat; m.hp = m.maxhp = fat ? 2 : 1; m.ph = Math.random() * 6;
+}
+
+function sliceAt(x, y) {
+  var a = Math.atan2(y - CY, x - CX) + PI / 2;
+  if (a < 0) a += TAU;
+  return Math.floor(a / SL) % 8;
+}
+
+function regrow() {
+  for (var k = 0; k < 8; k++) {
+    if (!slices[k] && k !== held) {
+      slices[k] = 1; sliceCount++;
+      var a = -PI / 2 + (k + 0.5) * SL;
+      burst(CX + Math.cos(a) * R * 0.6, CY + Math.sin(a) * R * 0.6, 12, 90, '#ffe9a8', 3);
+      pop(CX, CY - R - 24, 'Fresh slice!', '#ffe9a8');
+      tone(500, 900, 0.18, 'sine', 0.08);
+      return;
+    }
+  }
+}
+
+function endGame(win) {
+  if (state !== 0) return;
+  state = win ? 1 : 2; endT = 0;
+  finalScore = score + (win ? sliceCount * 25 : 0);
+  if (finalScore > best) { best = finalScore; newBest = true; bestStr = 'Best ' + best; try { localStorage.setItem('crumbKingdomBest', String(best)); } catch (e) {} }
+  finalStr = 'Score ' + finalScore;
+  bestEndStr = newBest ? 'New best!' : bestStr;
+  dragOn = false; if (held >= 0) { held = -1; }
+  tone(win ? 500 : 200, win ? 1000 : 70, 0.5, win ? 'sine' : 'sawtooth', 0.1);
+}
+
+function biteCake(m) {
+  var s0 = sliceAt(m.x, m.y), k, idx = -1;
+  for (k = 0; k < 8; k++) {
+    var a = (s0 + k) % 8, b = (s0 + 8 - k) % 8;
+    if (slices[a] && a !== held) { idx = a; break; }
+    if (slices[b] && b !== held) { idx = b; break; }
+  }
+  m.on = false;
+  burst(m.x, m.y, 14, 120, '#ff6b6b', 3.5);
+  if (idx < 0 && held >= 0) { held = -1; dragOn = false; }
+  if (idx >= 0) {
+    slices[idx] = 0; sliceCount--;
+    var an = -PI / 2 + (idx + 0.5) * SL;
+    burst(CX + Math.cos(an) * R * 0.7, CY + Math.sin(an) * R * 0.7, 14, 130, '#ffd1e0', 4);
+  }
+  pop(m.x, m.y - 10, 'Lost a slice!', '#ff6b6b');
+  setChain(0);
+  shake = 12; flashT = 0.25;
+  tone(170, 55, 0.22, 'sawtooth', 0.12);
+  if (sliceCount <= 0 && held < 0) endGame(false);
+}
+
+function killMouse(m) {
+  m.on = false;
+  burst(m.x, m.y, 12, 150, null, 3.5);
+  var before = mult;
+  addScore(10 * mult);
+  pop(m.x, m.y - 8, scorePopStr[mult], '#fff5e0');
+  if (t - lastFeed < FEED_WIN) setChain(chain + 1);
+  kills++;
+  if (tut < 2) { tut = 2; if (!normalOn) { normalOn = true; spawnT = 1.2; } }
+  if (mult > before) { pop(CX, CY - R - 46, streakStr[mult], '#ffd24a'); tone(600, 1100, 0.2, 'triangle', 0.1); shake = Math.max(shake, 5); }
+  else tone(330, 140, 0.1, 'triangle', 0.08);
+  if (kills % 4 === 0) regrow();
+}
+
+function dropSlice(sp) {
+  // slice (held) is consumed on drop
+  var x = spX[sp], y = spY[sp];
+  held = -1;
+  lastFeed = t;
+  if (!spHas[sp]) {
+    spHas[sp] = 1; spAmmo[sp] = MAXAMMO; spCd[sp] = 0.25;
+    setChain(chain + 1);
+    pop(x, y - 40, 'Cannon ready!', '#ffd24a');
+    burst(x, y, 12, 110, '#fff5e0', 3.5); tone(420, 760, 0.15, 'sine', 0.1);
+    if (tut === 0) tut = 1;
+  } else if (spAmmo[sp] <= 3) {
+    spAmmo[sp] = MAXAMMO; spCd[sp] = 0.2;
+    setChain(chain + 2);
+    pop(x, y - 40, 'Refilled! +2', '#ffd24a');
+    burst(x, y, 14, 120, '#fff5e0', 3.5); tone(480, 900, 0.18, 'sine', 0.1);
+  } else {
+    spAmmo[sp] = MAXAMMO;
+    setChain(0);
+    pop(x, y - 40, 'Wasted!', '#ff6b6b');
+    burst(x, y, 10, 90, '#c9a27a', 3); tone(260, 140, 0.18, 'square', 0.06);
+  }
+}
+
+// ---------- input ----------
+function lx(e) { return (e.clientX - vox) / vs; }
+function ly(e) { return (e.clientY - voy) / vs; }
+function pickSpot(x, y) {
+  var k, bd = 80 * 80, bi = -1;
+  for (k = 0; k < 4; k++) {
+    var dx = x - spX[k], dy = y - spY[k], d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; bi = k; }
+  }
+  if (bi >= 0) return bi;
+  var rx = x - CX, ry = y - CY, rl = Math.sqrt(rx * rx + ry * ry);
+  if (rl < R + 25) return -1;
+  var bc = 0.7;
+  for (k = 0; k < 4; k++) {
+    var sx = spX[k] - CX, sy = spY[k] - CY, sl = Math.sqrt(sx * sx + sy * sy);
+    var c = (rx * sx + ry * sy) / (rl * sl);
+    if (c > bc) { bc = c; bi = k; }
+  }
+  return bi;
+}
+function onDown(e) {
+  e.preventDefault();
+  initAudio();
+  var x = lx(e), y = ly(e);
+  if (x >= 336 && x <= 384 && y >= 6 && y <= 54) { reset(); tone(400, 600, 0.1, 'sine', 0.06); return; }
+  if (state !== 0) {
+    if (endT > 0.4 && x >= 95 && x <= 295 && y >= 560 && y <= 624) { reset(); tone(400, 700, 0.12, 'sine', 0.08); }
+    return;
+  }
+  if (dragOn) return;
+  var dx = x - CX, dy = y - CY;
+  if (dx * dx + dy * dy <= (R + 16) * (R + 16)) {
+    var s = sliceAt(x, y);
+    if (!slices[s]) {
+      // allow nearest present slice for forgiving touch
+      var k, f = -1;
+      for (k = 1; k < 4 && f < 0; k++) { if (slices[(s + k) % 8]) f = (s + k) % 8; else if (slices[(s + 8 - k) % 8]) f = (s + 8 - k) % 8; }
+      if (f < 0) return;
+      s = f;
+    }
+    slices[s] = 0; sliceCount--; held = s; dragOn = true; dragPid = e.pointerId; dragX = x; dragY = y; hoverSpot = -1;
+    try { canvas.setPointerCapture(e.pointerId); } catch (er) {}
+    tone(300, 420, 0.06, 'sine', 0.06);
+    burst(x, y, 5, 60, '#ffd1e0', 2.5);
+  }
+}
+function onMove(e) {
+  if (!dragOn || e.pointerId !== dragPid) return;
+  e.preventDefault();
+  dragX = lx(e); dragY = ly(e);
+  hoverSpot = pickSpot(dragX, dragY);
+}
+function onUp(e) {
+  if (!dragOn || e.pointerId !== dragPid) return;
+  e.preventDefault();
+  dragX = lx(e); dragY = ly(e);
+  var sp = e.type === 'pointercancel' ? -1 : pickSpot(dragX, dragY);
+  dragOn = false; dragPid = -1; hoverSpot = -1;
+  if (state !== 0) return;
+  if (sp >= 0) dropSlice(sp);
+  else { // cancelled: put it back
+    if (held >= 0) { if (!slices[held]) { slices[held] = 1; sliceCount++; } held = -1; }
+  }
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+// ---------- update ----------
+function update(dt) {
+  var k, j;
+  if (shake > 0) shake = Math.max(0, shake - 30 * dt);
+  if (flashT > 0) flashT -= dt;
+  // particles & pops always
+  for (k = 0; k < MAXP; k++) {
+    var p = parts[k]; if (!p.on) continue;
+    p.life -= dt; if (p.life <= 0) { p.on = false; continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 260 * dt; p.vx *= 0.99;
+  }
+  for (k = 0; k < MAXPOP; k++) {
+    var q = pops[k]; if (!q.on) continue;
+    q.age += dt; q.y -= 28 * dt; if (q.age > 1) q.on = false;
+  }
+  if (state !== 0) { endT += dt; return; }
+
+  t += dt;
+  if (chain > 0 && t - lastFeed >= FEED_WIN) setChain(0);
+  if (t >= RUN) { endGame(true); return; }
+  if (!tutMouse && t >= 0.4) { tutMouse = true; spawnMouse(true); }
+  if (!normalOn && t >= 10) { normalOn = true; spawnT = 0.5; }
+  if (normalOn) {
+    spawnT -= dt;
+    if (spawnT <= 0) {
+      spawnMouse(false);
+      var iv = 2.0 - t * 0.017; if (iv < 0.75) iv = 0.75;
+      spawnT = iv * (0.8 + Math.random() * 0.4);
+    }
+  }
+
+  // cannons
+  for (k = 0; k < 4; k++) {
+    if (spKick[k] > 0) spKick[k] = Math.max(0, spKick[k] - 8 * dt);
+    if (!spHas[k] || spAmmo[k] < 1) continue;
+    var bx = spX[k], by = spY[k], bestD = 1e9, tm = null;
+    for (j = 0; j < MAXMICE; j++) {
+      var m = mice[j]; if (!m.on) continue;
+      var ddx = m.x - bx, ddy = m.y - by;
+      if (ddx * ddx + ddy * ddy > RANGE * RANGE) continue;
+      var cx = m.x - CX, cy = m.y - CY, cd = cx * cx + cy * cy;
+      if (cd < bestD) { bestD = cd; tm = m; }
+    }
+    if (tm) {
+      spAng[k] = Math.atan2(tm.y - by, tm.x - bx);
+      spCd[k] -= dt;
+      if (spCd[k] <= 0) {
+        spCd[k] = FIRE_CD; spAmmo[k] -= 1; spKick[k] = 1;
+        for (j = 0; j < MAXB; j++) {
+          var b = bul[j];
+          if (!b.on) {
+            b.on = true; b.x = bx + Math.cos(spAng[k]) * 26; b.y = by + Math.sin(spAng[k]) * 26;
+            // light lead
+            var lt = Math.sqrt((tm.x - bx) * (tm.x - bx) + (tm.y - by) * (tm.y - by)) / 520;
+            var tx = tm.x + tm.vx * lt, ty = tm.y + tm.vy * lt;
+            var a2 = Math.atan2(ty - by, tx - bx);
+            b.vx = Math.cos(a2) * 520; b.vy = Math.sin(a2) * 520; b.life = 0.9;
+            break;
+          }
+        }
+        var nowMs = (t * 1000) | 0;
+        if (nowMs - lastSnd > 70) { lastSnd = nowMs; tone(700, 380, 0.05, 'square', 0.025); }
+        if (spAmmo[k] < 1) { pop(bx, by - 40, 'Out of cream', '#fff5e0'); burst(bx, by, 6, 60, '#c9a27a', 3); }
+      }
+    }
+  }
+
+  // bullets
+  for (k = 0; k < MAXB; k++) {
+    var bb = bul[k]; if (!bb.on) continue;
+    bb.x += bb.vx * dt; bb.y += bb.vy * dt; bb.life -= dt;
+    if (bb.life <= 0) { bb.on = false; continue; }
+    for (j = 0; j < MAXMICE; j++) {
+      var mm = mice[j]; if (!mm.on) continue;
+      var hx = mm.x - bb.x, hy = mm.y - bb.y;
+      if (hx * hx + hy * hy < 19 * 19) {
+        bb.on = false; mm.hp -= 1;
+        burst(bb.x, bb.y, 4, 90, '#fff5e0', 3);
+        if (mm.hp <= 0) killMouse(mm);
+        else { tone(240, 160, 0.06, 'triangle', 0.06); mm.x -= mm.vx * 0.12; mm.y -= mm.vy * 0.12; }
+        break;
+      }
+    }
+  }
+
+  // mice
+  for (k = 0; k < MAXMICE; k++) {
+    var mo = mice[k]; if (!mo.on) continue;
+    mo.x += mo.vx * dt; mo.y += mo.vy * dt; mo.ph += dt * 9;
+    var ex = mo.x - CX, ey = mo.y - CY;
+    if (ex * ex + ey * ey < (R + 6) * (R + 6)) { biteCake(mo); if (state !== 0) return; }
+  }
+}
+
+// ---------- render ----------
+function wedge(cx, cy, a0, a1, r, fill, stroke) {
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, r, a0, a1); ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = stroke; ctx.stroke();
+}
+function txt(s, x, y, font, col, al) {
+  ctx.font = font; ctx.fillStyle = col; ctx.textAlign = al; ctx.fillText(s, x, y);
+}
+function drawMouse(m) {
+  var x = m.x, y = m.y, s = m.fat ? 1.35 : 1, wob = Math.sin(m.ph) * 1.5;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(Math.atan2(m.vy, m.vx) + PI / 2); ctx.scale(s, s);
+  ctx.strokeStyle = '#e8a0a0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 12); ctx.quadraticCurveTo(wob * 3, 22, -wob * 2, 30); ctx.stroke();
+  ctx.fillStyle = m.fat ? '#8d8d9a' : '#b5b5c4';
+  ctx.beginPath(); ctx.ellipse(0, 2, 11, 15, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(-8, -8, 6, 0, TAU); ctx.arc(8, -8, 6, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#ffb3c1'; ctx.beginPath(); ctx.arc(-8, -8, 3.4, 0, TAU); ctx.arc(8, -8, 3.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(-4, -6, 1.8, 0, TAU); ctx.arc(4, -6, 1.8, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#ff6b8a'; ctx.beginPath(); ctx.arc(0, -15, 2.4, 0, TAU); ctx.fill();
+  ctx.restore();
+  if (m.maxhp > 1) {
+    ctx.fillStyle = '#000'; ctx.fillRect(x - 14, y - 30, 28, 5);
+    ctx.fillStyle = '#7ddc6b'; ctx.fillRect(x - 13, y - 29, 26 * m.hp / m.maxhp, 3);
+  }
+}
+function drawCannon(k) {
+  var x = spX[k], y = spY[k], pulse = 0.5 + 0.5 * Math.sin(t * 4 + k);
+  var hov = hoverSpot === k;
+  if (!spHas[k]) {
+    ctx.setLineDash(DASH); ctx.lineWidth = 3;
+    ctx.strokeStyle = hov ? '#ffd24a' : '#fff5e0'; ctx.globalAlpha = dragOn ? 0.9 : 0.5;
+    ctx.beginPath(); ctx.arc(x, y, 28 + (dragOn ? pulse * 3 : 0), 0, TAU); ctx.stroke(); ctx.setLineDash(NODASH); ctx.globalAlpha = 1;
+    txt('+', x, y + 9, FONT_L, hov ? '#ffd24a' : '#d9cdb8', 'center');
+    return;
+  }
+  var empty = spAmmo[k] < 1;
+  ctx.fillStyle = empty ? '#7a6a5a' : '#ffb3c8'; ctx.strokeStyle = '#7a3a52'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, 24, 0, TAU); ctx.fill(); ctx.stroke();
+  ctx.save(); ctx.translate(x, y); ctx.rotate(spAng[k]);
+  var kick = spKick[k] * 5;
+  ctx.fillStyle = empty ? '#5a4a3a' : '#fff5e0'; ctx.fillRect(2 - kick, -7, 28, 14);
+  ctx.strokeStyle = '#7a3a52'; ctx.lineWidth = 2; ctx.strokeRect(2 - kick, -7, 28, 14);
+  ctx.restore();
+  ctx.lineWidth = 5; ctx.strokeStyle = empty ? '#ff6b6b' : '#fff5e0';
+  if (!empty || pulse > 0.5) { ctx.beginPath(); ctx.arc(x, y, 33, -PI / 2, -PI / 2 + TAU * (empty ? 1 : spAmmo[k] / MAXAMMO)); ctx.stroke(); }
+  if (hov) { ctx.lineWidth = 3; ctx.strokeStyle = '#ffd24a'; ctx.beginPath(); ctx.arc(x, y, 40, 0, TAU); ctx.stroke(); }
+  if (empty) txt('Feed me!', x, y + 54, FONT_S, '#ffd24a', 'center');
+  else if (spAmmo[k] <= 3) txt('Low', x, y + 54, FONT_S, '#ffd24a', 'center');
+}
+function render() {
+  var k;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#2a1a10'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  var sx = 0, sy = 0;
+  if (shake > 0) { sx = (Math.random() - 0.5) * shake; sy = (Math.random() - 0.5) * shake; }
+  ctx.setTransform(dpr * vs, 0, 0, dpr * vs, dpr * (vox + sx * vs), dpr * (voy + sy * vs));
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+  // table
+  ctx.fillStyle = '#8b5a33'; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.fillStyle = '#9c6a3e'; ctx.beginPath(); ctx.arc(CX, CY, 330, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(CX, CY, 330, 0, TAU); ctx.stroke(); ctx.beginPath(); ctx.arc(CX, CY, 230, 0, TAU); ctx.stroke();
+  if (flashT > 0) { ctx.globalAlpha = 0.25; ctx.fillStyle = '#ff3c3c'; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  // plate + cake
+  ctx.fillStyle = '#f2ece4'; ctx.beginPath(); ctx.arc(CX, CY, R + 12, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#cfc4b6'; ctx.lineWidth = 3; ctx.stroke();
+  for (k = 0; k < 8; k++) {
+    if (!slices[k]) continue;
+    var a0 = -PI / 2 + k * SL;
+    wedge(CX, CY, a0, a0 + SL, R, (k & 1) ? '#ffc4d6' : '#ffd9e6', '#b8607f');
+    ctx.fillStyle = '#e8456f'; ctx.beginPath(); ctx.arc(CX + Math.cos(a0 + SL / 2) * R * 0.62, CY + Math.sin(a0 + SL / 2) * R * 0.62, 5, 0, TAU); ctx.fill();
+  }
+  if (sliceCount === 0) txt('Empty!', CX, CY + 6, FONT_M, '#b8607f', 'center');
+  // tutorial hints on world
+  if (tut === 0 && state === 0 && !dragOn && slices[0]) {
+    var ph = (t * 0.7) % 1, sa = -PI / 2 + SL / 2;
+    var fx = CX + Math.cos(sa) * R * 0.6, fy = CY + Math.sin(sa) * R * 0.6;
+    var gx = fx + (spX[1] - fx) * ph, gy = fy + (spY[1] - fy) * ph;
+    ctx.fillStyle = '#ffffff'; ctx.globalAlpha = 0.75; ctx.beginPath(); ctx.arc(gx, gy, 14, 0, TAU); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.strokeStyle = '#ffd24a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(spX[1], spY[1], 36 + 4 * Math.sin(t * 6), 0, TAU); ctx.stroke();
+  }
+  // cannons
+  for (k = 0; k < 4; k++) drawCannon(k);
+  // bullets
+  ctx.fillStyle = '#fffdf2'; ctx.strokeStyle = '#ffb3c8'; ctx.lineWidth = 2;
+  for (k = 0; k < MAXB; k++) { var b = bul[k]; if (!b.on) continue; ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, TAU); ctx.fill(); ctx.stroke(); }
+  // mice
+  for (k = 0; k < MAXMICE; k++) if (mice[k].on) drawMouse(mice[k]);
+  // particles
+  for (k = 0; k < MAXP; k++) {
+    var p = parts[k]; if (!p.on) continue;
+    ctx.globalAlpha = p.life / p.max; ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // dragged slice
+  if (dragOn) {
+    ctx.save(); ctx.translate(dragX, dragY - 24);
+    ctx.rotate(Math.atan2(dragY - CY, dragX - CX) + PI / 2 + SL / 2);
+    wedge(0, 0, -PI / 2 - SL / 2, -PI / 2 + SL / 2, 52, '#ffc4d6', '#b8607f');
+    ctx.restore();
+  }
+  // pops
+  for (k = 0; k < MAXPOP; k++) {
+    var q = pops[k]; if (!q.on) continue;
+    ctx.globalAlpha = q.age < 0.6 ? 1 : 1 - (q.age - 0.6) / 0.4;
+    txt(q.txt, q.x, q.y, FONT_POP, '#2a1a10', 'center');
+    txt(q.txt, q.x - 1, q.y - 1, FONT_POP, q.col, 'center');
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // ---------- HUD ----------
+  ctx.fillStyle = '#1e1008'; ctx.fillRect(0, 0, W, 98);
+  // cake meter
+  ctx.fillStyle = '#000'; ctx.fillRect(10, 12, 150, 22);
+  var frac = sliceCount / 8;
+  ctx.fillStyle = frac > 0.5 ? '#ff8fb0' : (frac > 0.25 ? '#ffb347' : '#ff4a4a');
+  ctx.fillRect(12, 14, 146 * frac, 18);
+  txt(cakeStr[sliceCount], 85, 29, FONT_S, '#fff', 'center');
+  txt(scoreStr, 12, 54, FONT_M, '#fff5e0', 'left');
+  txt(bestStr, 12, 76, FONT_S, '#e0c9a8', 'left');
+  txt(timeStr[Math.ceil(RUN - t) > 0 ? Math.ceil(RUN - t) : 0], 230, 29, FONT_M, '#fff5e0', 'center');
+  // restart button
+  ctx.fillStyle = '#ffd24a'; ctx.beginPath(); ctx.arc(360, 30, 22, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#5a3a10'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(360, 30, 9, -PI * 0.2, PI * 1.5); ctx.stroke();
+  ctx.fillStyle = '#5a3a10'; ctx.beginPath(); ctx.moveTo(366, 15); ctx.lineTo(376, 28); ctx.lineTo(356, 25); ctx.closePath(); ctx.fill();
+  // streak
+  var scol = mult >= 4 ? '#ff6b3d' : (mult >= 2 ? '#ffd24a' : '#c9b79e');
+  txt(streakStr[mult], 265, 62, FONT_M, scol, 'center');
+  for (k = 0; k < 3; k++) {
+    ctx.fillStyle = (mult >= 5 || k < chain % 3) ? scol : '#6a5a4a';
+    ctx.beginPath(); ctx.arc(220 + k * 22 + 22, 80, 6, 0, TAU); ctx.fill();
+  }
+  // time bar
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 94, W, 4);
+  ctx.fillStyle = '#7ddc6b'; ctx.fillRect(0, 94, W * Math.min(1, t / RUN), 4);
+
+  // tutorial banner
+  if (state === 0 && (tut < 2 || t < 14)) {
+    var msg = tut === 0 ? 'Swipe a slice onto a sentry spot!' : (tut === 1 ? 'Your cream cannon fires at the mouse!' : 'Nice! Keep feeding cannons!');
+    if (tut < 2 || t < 14) {
+      ctx.fillStyle = '#1e1008'; ctx.fillRect(15, 740, 360, 44);
+      txt(msg, CX, 768, FONT_M, '#ffd24a', 'center');
+    }
+  }
+
+  // end overlay
+  if (state !== 0) {
+    var al = Math.min(1, endT * 2);
+    ctx.globalAlpha = 0.78 * al; ctx.fillStyle = '#140a05'; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = al;
+    txt(state === 1 ? 'Kingdom saved!' : 'Cake gone!', CX, 300, FONT_XL, state === 1 ? '#ffd24a' : '#ff6b6b', 'center');
+    txt(finalStr, CX, 370, FONT_L, '#fff5e0', 'center');
+    txt(bestEndStr, CX, 410, FONT_M, newBest ? '#ffd24a' : '#e0c9a8', 'center');
+    txt(cakeStr[sliceCount], CX, 450, FONT_M, '#ffc4d6', 'center');
+    ctx.fillStyle = '#ffd24a'; ctx.fillRect(95, 560, 200, 64);
+    txt('Play again', CX, 600, FONT_L, '#5a3a10', 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- loop ----------
+function frame(now) {
+  if (!last) last = now;
+  var dt = (now - last) / 1000; last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+document.addEventListener('visibilitychange', function () { last = 0; });
+reset();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
