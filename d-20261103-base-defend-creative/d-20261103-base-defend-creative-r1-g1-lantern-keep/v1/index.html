@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Lantern Keep</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#04050a;overflow:hidden;overscroll-behavior:none}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;outline:none}
+</style>
+</head>
+<body>
+<canvas id="c" width="390" height="844"></canvas>
+<script>
+(function () {
+'use strict';
+
+// ---------------------------------------------------------------- constants
+var W = 390, H = 844;                 // logical resolution (9:16-ish phone baseline)
+var WALL_X = 14, WALL_W = 362, WALL_Y = 380, WALL_H = 70;
+var SLOT_N = 7, SLOT_X0 = 45, SLOT_DX = 50;   // gap slots along the wall
+var BEAM_HALF = 40;                   // beam is 80 px wide at the wall
+var COVER_HALF = 34;                  // gap centre must be this close to beam centre
+var LANTERN_Y = 700;
+var BEAM_MIN = 30, BEAM_MAX = 360;
+var MAX_BRICKS = 8, MAX_STREAK = 5, NIGHTS = 6;
+var STEP = 1 / 120;                   // fixed update step (120 Hz)
+var MAX_SHADOWS = 6, MAX_PART = 96, MAX_POP = 8;
+
+// per-night tuning (index 0 = night 1)
+var N_GAPS    = [3, 3, 4, 4, 5, 5];
+var N_PREVIEW = [3.0, 3.0, 2.9, 2.8, 2.7, 2.6];
+var N_PLAN    = [3.2, 3.0, 2.8, 2.6, 2.4, 2.2];
+var N_TRAVEL  = [1.10, 1.00, 0.90, 0.80, 0.75, 0.70];
+var N_STAGGER = [0.95, 0.85, 0.75, 0.70, 0.65, 0.60];
+var REST_T = 1.4;
+
+var PH_PREVIEW = 0, PH_PLAN = 1, PH_RUSH = 2, PH_REST = 3, PH_OVER = 4;
+var PH_NAMES = ['preview', 'plan', 'rush', 'rest', 'over'];
+
+var POP_TEXT = ['+100', '+200', '+300', '+400', '+500', '-1 brick'];
+var STREAK_TEXT = ['x0', 'x1', 'x2', 'x3', 'x4', 'x5'];
+var STREAK_COL = ['#fff', '#cfd6ff', '#a8e6ff', '#8dffc4', '#ffe27a', '#ffb347'];
+
+// ---------------------------------------------------------------- canvas
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+
+function resize() {
+  var s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  if (!(s > 0)) s = 1;
+  var cw = W * s, ch = H * s;
+  cv.style.width = cw + 'px';
+  cv.style.height = ch + 'px';
+  var dpr = Math.min(window.devicePixelRatio || 1, 3);
+  cv.width = Math.round(cw * dpr);
+  cv.height = Math.round(ch * dpr);
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------------------------------------------------------------- prerendered sprites (built once)
+function makeCanvas(w, h) {
+  var c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return c;
+}
+
+function paintWall(c, brick, mortar, edge) {
+  var g = c.getContext('2d');
+  g.fillStyle = mortar;
+  g.fillRect(WALL_X, 0, WALL_W, WALL_H);
+  var rows = 4, bh = WALL_H / rows, bw = 31;
+  for (var r = 0; r < rows; r++) {
+    var off = (r % 2) ? -bw / 2 : 0;
+    for (var x = WALL_X + off; x < WALL_X + WALL_W; x += bw) {
+      var x0 = Math.max(x + 1, WALL_X), x1 = Math.min(x + bw - 1, WALL_X + WALL_W);
+      if (x1 <= x0) continue;
+      g.fillStyle = brick;
+      g.fillRect(x0, r * bh + 1, x1 - x0, bh - 2);
+    }
+  }
+  g.fillStyle = edge;
+  g.fillRect(WALL_X, 0, WALL_W, 3);
+}
+var wallDark = makeCanvas(W, WALL_H);
+var wallWarm = makeCanvas(W, WALL_H);
+var wallMoon = makeCanvas(W, WALL_H);
+paintWall(wallDark, '#171a27', '#0d0f17', '#1d2133');
+paintWall(wallWarm, '#b58d5c', '#5f4529', '#e3c088');
+paintWall(wallMoon, '#6f86b3', '#2c3752', '#a9c0ee');
+
+// light cone from wall bottom down to lantern
+var coneH = LANTERN_Y - (WALL_Y + WALL_H) - 8;
+var coneSpr = makeCanvas(BEAM_HALF * 2, coneH);
+(function () {
+  var g = coneSpr.getContext('2d');
+  var gr = g.createLinearGradient(0, 0, 0, coneH);
+  gr.addColorStop(0, 'rgba(255,226,150,0.20)');
+  gr.addColorStop(1, 'rgba(255,230,160,0.60)');
+  g.fillStyle = gr;
+  g.beginPath();
+  g.moveTo(0, 0); g.lineTo(BEAM_HALF * 2, 0);
+  g.lineTo(BEAM_HALF + 10, coneH); g.lineTo(BEAM_HALF - 10, coneH);
+  g.closePath(); g.fill();
+})();
+
+var glowSpr = makeCanvas(120, 120);
+(function () {
+  var g = glowSpr.getContext('2d');
+  var gr = g.createRadialGradient(60, 60, 2, 60, 60, 60);
+  gr.addColorStop(0, 'rgba(255,236,170,0.95)');
+  gr.addColorStop(0.35, 'rgba(255,200,100,0.35)');
+  gr.addColorStop(1, 'rgba(255,180,80,0)');
+  g.fillStyle = gr;
+  g.fillRect(0, 0, 120, 120);
+})();
+
+// static background: sky, stars, moon, ground, keep silhouette
+var bgSpr = makeCanvas(W, H);
+(function () {
+  var g = bgSpr.getContext('2d');
+  var gr = g.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, '#080a18');
+  gr.addColorStop(0.5, '#0d1020');
+  gr.addColorStop(1, '#05060b');
+  g.fillStyle = gr;
+  g.fillRect(0, 0, W, H);
+  var seed = 7;
+  for (var i = 0; i < 60; i++) {
+    seed = (seed * 16807) % 2147483647;
+    var sx = (seed % 1000) / 1000 * W;
+    seed = (seed * 16807) % 2147483647;
+    var sy = (seed % 1000) / 1000 * 330;
+    g.fillStyle = 'rgba(200,215,255,' + (0.15 + (i % 4) * 0.1) + ')';
+    g.fillRect(sx, sy, 1.5, 1.5);
+  }
+  g.fillStyle = '#c9d6f5';
+  g.beginPath(); g.arc(62, 215, 20, 0, 6.2832); g.fill();
+  g.fillStyle = '#080a18';
+  g.beginPath(); g.arc(70, 210, 18, 0, 6.2832); g.fill();
+  // keep body + battlements
+  g.fillStyle = '#0f1220';
+  g.fillRect(132, 290, 126, 92);
+  for (var b = 0; b < 4; b++) g.fillRect(132 + b * 34, 276, 22, 16);
+  g.fillStyle = '#161a2c';
+  g.fillRect(132, 290, 126, 4);
+  // ground
+  g.fillStyle = '#07080f';
+  g.fillRect(0, WALL_Y + WALL_H, W, H - WALL_Y - WALL_H);
+  // bottom control zone
+  g.fillStyle = 'rgba(255,255,255,0.03)';
+  g.fillRect(0, 563, W, H - 563);
+  g.fillStyle = 'rgba(255,255,255,0.10)';
+  g.fillRect(0, 563, W, 1);
+})();
+
+// ---------------------------------------------------------------- state (all preallocated)
+var phase = PH_PREVIEW, phT = 0, phDur = 3;
+var night = 1, score = 0, best = 0, streak = 1, bricks = MAX_BRICKS;
+var beamX = W / 2, targetX = W / 2;
+var dragging = false, dragId = -1;
+var keyL = false, keyR = false;
+var time = 0;
+var newBest = false, won = false, overT = 0;
+var shakeT = 0, streakPulse = 0, brokenT = 0, perfectFlag = 0;
+var missFlash = 0, goodFlash = 0, ringT = 0, bannerT = 0, armT = 0, hasDragged = false;
+var BANNER_DUR = 1.6;
+var bannerStr = '', bannerSub = '', brickStr = 'Keep 8/8', shownBricks = -1;
+// restart button hit box (logical px, >= 44 tall)
+var RB_X = 6, RB_Y = 42, RB_W = 52, RB_H = 48, RB_ARM_W = 150;
+var gapLit = new Uint8Array(8);
+var gapTick = new Float32Array(8);
+
+var gapX = new Float32Array(8);
+var gapState = new Uint8Array(8);       // 0 pending, 1 covered, 2 breached
+var gapFlash = new Float32Array(8);
+var gapN = 0;
+var slots = [0, 1, 2, 3, 4, 5, 6];
+var order = [0, 1, 2, 3, 4, 5, 6];
+
+var shGap = new Int8Array(MAX_SHADOWS);
+var shSpawn = new Float32Array(MAX_SHADOWS);
+var shX0 = new Float32Array(MAX_SHADOWS);
+var shState = new Uint8Array(MAX_SHADOWS); // 0 waiting, 1 flying, 2 done
+var shN = 0, rushT = 0, rushDone = 0, travel = 1, nightCovered = 0;
+
+var pX = new Float32Array(MAX_PART), pY = new Float32Array(MAX_PART);
+var pVX = new Float32Array(MAX_PART), pVY = new Float32Array(MAX_PART);
+var pLife = new Float32Array(MAX_PART), pKind = new Uint8Array(MAX_PART);
+var pNext = 0;
+
+var popX = new Float32Array(MAX_POP), popY = new Float32Array(MAX_POP);
+var popLife = new Float32Array(MAX_POP), popTxt = new Uint8Array(MAX_POP);
+var popNext = 0;
+
+// cached text (rebuilt only when values change)
+var scoreStr = 'Score 0', bestStr = 'Best 0', nightStr = 'Night 1/6';
+var restStr = '', overScoreStr = '', overBestStr = '';
+var shownScore = -1, shownBest = -1, shownNight = -1;
+
+// QA debug
+var lk = window.__lk = {
+  score: 0, streak: 1, bricks: MAX_BRICKS, night: 1, phase: 'preview', best: 0,
+  beamX: W / 2, gaps: [], won: false,
+  setBeam: function (x) { targetX = clampBeam(x); beamX = targetX; }
+};
+
+try { best = parseInt(localStorage.getItem('lk_best_v1'), 10) || 0; } catch (e) { best = 0; }
+
+function clampBeam(x) { return x < BEAM_MIN ? BEAM_MIN : (x > BEAM_MAX ? BEAM_MAX : x); }
+function rnd() { return Math.random(); }
+
+// ---------------------------------------------------------------- audio (only after first tap)
+var AC = null;
+function unlockAudio() {
+  try {
+    if (!AC) {
+      var C = window.AudioContext || window.webkitAudioContext;
+      if (C) AC = new C();
+    }
+    if (AC && AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f, d, type, vol, f2) {
+  if (!AC) return;
+  try {
+    var t = AC.currentTime;
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t); o.stop(t + d + 0.02);
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------- game flow
+function syncDebug() {
+  lk.score = score; lk.streak = streak; lk.bricks = bricks; lk.night = night;
+  lk.phase = PH_NAMES[phase]; lk.best = best; lk.won = won;
+}
+
+function setPhase(p, dur) {
+  phase = p; phT = 0; phDur = dur;
+  syncDebug();
+}
+
+function addScore(v) {
+  score += v;
+  if (score > best) { best = score; newBest = true; }
+}
+
+function startNight(n) {
+  night = n;
+  var i, j, t;
+  gapN = N_GAPS[n - 1];
+  for (i = SLOT_N - 1; i > 0; i--) {            // shuffle slots in place
+    j = (rnd() * (i + 1)) | 0; t = slots[i]; slots[i] = slots[j]; slots[j] = t;
+  }
+  lk.gaps.length = gapN;
+  for (i = 0; i < gapN; i++) {
+    gapX[i] = SLOT_X0 + slots[i] * SLOT_DX;
+    gapState[i] = 0; gapFlash[i] = 0; gapLit[i] = 0; gapTick[i] = 0;
+    order[i] = i;
+    lk.gaps[i] = gapX[i];
+  }
+  for (i = gapN - 1; i > 0; i--) {              // shuffle arrival order
+    j = (rnd() * (i + 1)) | 0; t = order[i]; order[i] = order[j]; order[j] = t;
+  }
+  nightCovered = 0;
+  bannerStr = 'Night ' + n; bannerSub = 'Memorize the cracks'; bannerT = BANNER_DUR;
+  tone(300 + n * 30, 0.25, 'sine', 0.05, 450 + n * 30);
+  setPhase(PH_PREVIEW, N_PREVIEW[n - 1]);
+}
+
+function startRush() {
+  var n = night - 1;
+  travel = N_TRAVEL[n];
+  shN = gapN; rushT = 0; rushDone = 0;
+  for (var i = 0; i < shN; i++) {
+    shGap[i] = order[i];
+    shSpawn[i] = i * N_STAGGER[n];
+    var g = gapX[order[i]];
+    var x0 = g + (rnd() * 2 - 1) * 110;
+    shX0[i] = x0 < 12 ? 12 : (x0 > 378 ? 378 : x0);
+    shState[i] = 0;
+  }
+  setPhase(PH_RUSH, 0);
+  tone(110, 0.5, 'sawtooth', 0.05, 70);
+}
+
+function newGame() {
+  score = 0; streak = 1; bricks = MAX_BRICKS; newBest = false; won = false;
+  shakeT = 0; streakPulse = 0; brokenT = 0; missFlash = 0; goodFlash = 0; armT = 0; ringT = 0;
+  for (var i = 0; i < MAX_PART; i++) pLife[i] = 0;
+  for (var k = 0; k < MAX_POP; k++) popLife[k] = 0;
+  startNight(1);
+}
+
+function endGame(win) {
+  won = win;
+  if (win) { addScore(bricks * 100); }
+  try { localStorage.setItem('lk_best_v1', '' + best); } catch (e) {}
+  overScoreStr = 'Score ' + score;
+  overBestStr = (newBest ? 'New best ' : 'Best ') + best;
+  overT = 0;
+  setPhase(PH_OVER, 0);
+  tone(win ? 523 : 140, 0.7, win ? 'triangle' : 'sawtooth', 0.09, win ? 880 : 60);
+}
+
+function spawnBurst(x, y, kind, count) {
+  for (var i = 0; i < count; i++) {
+    var a = rnd() * 6.2832, sp = 40 + rnd() * 150;
+    pX[pNext] = x; pY[pNext] = y;
+    pVX[pNext] = Math.cos(a) * sp; pVY[pNext] = Math.sin(a) * sp - 30;
+    pLife[pNext] = 0.5 + rnd() * 0.4; pKind[pNext] = kind;
+    pNext = (pNext + 1) % MAX_PART;
+  }
+}
+function spawnPop(x, y, txt) {
+  popX[popNext] = x; popY[popNext] = y; popLife[popNext] = 0.9; popTxt[popNext] = txt;
+  popNext = (popNext + 1) % MAX_POP;
+}
+
+function resolveShadow(i) {
+  var g = shGap[i], gx = gapX[g], gy = WALL_Y + WALL_H / 2;
+  var d = gx - beamX; if (d < 0) d = -d;
+  shState[i] = 2; rushDone++;
+  gapFlash[g] = 0.6;
+  if (d <= COVER_HALF) {                        // lit: shadow dissolves
+    gapState[g] = 1; nightCovered++;
+    addScore(100 * streak);
+    spawnPop(gx, gy - 30, streak - 1);
+    spawnBurst(gx, gy, 0, 16);
+    if (streak < MAX_STREAK) streak++;
+    streakPulse = 0.35; goodFlash = 0.25;
+    tone(520 + streak * 90, 0.22, 'triangle', 0.08, 900 + streak * 90);
+  } else {                                      // unlit: brick stolen
+    gapState[g] = 2;
+    bricks--;
+    streak = 1; brokenT = 1.0; streakPulse = 0;
+    shakeT = 0.35; missFlash = 0.4;
+    spawnPop(gx, gy - 30, 5);
+    spawnBurst(gx, gy, 1, 14);
+    tone(160, 0.3, 'sawtooth', 0.09, 60);
+    if (bricks <= 0) { bricks = 0; endGame(false); return; }
+  }
+  syncDebug();
+}
+
+function step(dt) {
+  time += dt;
+  // beam follow (fixed-step smoothing)
+  if (keyL) targetX = clampBeam(targetX - 420 * dt);
+  if (keyR) targetX = clampBeam(targetX + 420 * dt);
+  beamX += (targetX - beamX) * Math.min(1, dt * 30);
+
+  if (shakeT > 0) shakeT -= dt;
+  if (streakPulse > 0) streakPulse -= dt;
+  if (brokenT > 0) brokenT -= dt;
+  if (missFlash > 0) missFlash -= dt;
+  if (goodFlash > 0) goodFlash -= dt;
+  if (ringT > 0) ringT -= dt;
+  if (bannerT > 0) bannerT -= dt;
+  if (armT > 0) armT -= dt;
+  var i, dd, lit;
+  for (i = 0; i < gapN; i++) {
+    if (gapFlash[i] > 0) gapFlash[i] -= dt;
+    if (gapTick[i] > 0) gapTick[i] -= dt;
+    if (phase === PH_PLAN || phase === PH_RUSH) {   // tick when a crack enters the cover zone
+      dd = gapX[i] - beamX; if (dd < 0) dd = -dd;
+      lit = dd <= COVER_HALF ? 1 : 0;
+      if (lit !== gapLit[i]) {
+        gapLit[i] = lit;
+        if (lit && gapState[i] === 0) { gapTick[i] = 0.25; tone(760, 0.06, 'sine', 0.035, 980); }
+      }
+    }
+  }
+  for (i = 0; i < MAX_PART; i++) {
+    if (pLife[i] > 0) {
+      pLife[i] -= dt;
+      pX[i] += pVX[i] * dt; pY[i] += pVY[i] * dt;
+      pVY[i] += 160 * dt;
+    }
+  }
+  for (i = 0; i < MAX_POP; i++) if (popLife[i] > 0) { popLife[i] -= dt; popY[i] -= 26 * dt; }
+
+  phT += dt;
+  if (phase === PH_PREVIEW) {
+    if (phT >= phDur) setPhase(PH_PLAN, N_PLAN[night - 1]);
+  } else if (phase === PH_PLAN) {
+    if (phT >= phDur) startRush();
+  } else if (phase === PH_RUSH) {
+    rushT += dt;
+    for (i = 0; i < shN; i++) {
+      if (shState[i] === 0 && rushT >= shSpawn[i]) shState[i] = 1;
+      if (shState[i] === 1 && rushT >= shSpawn[i] + travel) {
+        resolveShadow(i);
+        if (phase !== PH_RUSH) return;
+      }
+    }
+    if (rushDone >= shN && phase === PH_RUSH) {
+      if (nightCovered === gapN) {
+        addScore(250);
+        if (bricks < MAX_BRICKS) bricks++;
+        restStr = bricks < MAX_BRICKS ? 'Perfect night! +250, brick mended' : 'Perfect night! +250';
+        perfectFlag = 1;
+        bannerStr = 'Perfect night!'; bannerSub = bricks < MAX_BRICKS ? '+250 and a brick mended' : '+250';
+      } else {
+        restStr = 'Night survived';
+        perfectFlag = 0;
+        bannerStr = 'Night survived'; bannerSub = 'Streak resets only on a miss';
+      }
+      bannerT = BANNER_DUR;
+      tone(392, 0.25, 'triangle', 0.06, 523);
+      setPhase(PH_REST, REST_T);
+    }
+  } else if (phase === PH_REST) {
+    if (phT >= phDur) {
+      if (night >= NIGHTS) endGame(true);
+      else startNight(night + 1);
+    }
+  } else {
+    overT += dt;
+  }
+  if (score !== lk.score || streak !== lk.streak || bricks !== lk.bricks) syncDebug();
+}
+
+// ---------------------------------------------------------------- input
+function evX(e) {
+  var r = cv.getBoundingClientRect();
+  return (e.clientX - r.left) / r.width * W;
+}
+function evY(e) {
+  var r = cv.getBoundingClientRect();
+  return (e.clientY - r.top) / r.height * H;
+}
+cv.addEventListener('pointerdown', function (e) {
+  e.preventDefault();
+  unlockAudio();
+  if (phase === PH_OVER) {
+    if (overT > 0.6) newGame();
+    return;
+  }
+  var px = evX(e), py = evY(e);
+  if (px >= RB_X && px <= RB_X + (armT > 0 ? RB_ARM_W : RB_W) && py >= RB_Y && py <= RB_Y + RB_H) {
+    if (armT > 0) { newGame(); armT = 0; tone(440, 0.15, 'triangle', 0.06, 660); }
+    else { armT = 2.2; tone(330, 0.08, 'square', 0.03); }
+    return;
+  }
+  armT = 0;
+  dragging = true; dragId = e.pointerId; hasDragged = true; ringT = 0.35;
+  targetX = clampBeam(px);
+  tone(600, 0.06, 'sine', 0.03, 760);
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+});
+cv.addEventListener('pointermove', function (e) {
+  if (dragging && e.pointerId === dragId) { e.preventDefault(); targetX = clampBeam(evX(e)); }
+});
+function endDrag(e) { if (e.pointerId === dragId) { dragging = false; dragId = -1; } }
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+window.addEventListener('keydown', function (e) {
+  if (e.key === 'ArrowLeft') { keyL = true; hasDragged = true; }
+  else if (e.key === 'ArrowRight') { keyR = true; hasDragged = true; }
+  else if (e.key === 'r' || e.key === 'R') newGame();
+  else if ((e.key === ' ' || e.key === 'Enter') && phase === PH_OVER && overT > 0.6) newGame();
+  unlockAudio();
+});
+window.addEventListener('keyup', function (e) {
+  if (e.key === 'ArrowLeft') keyL = false;
+  else if (e.key === 'ArrowRight') keyR = false;
+});
+
+// ---------------------------------------------------------------- rendering
+function drawGap(i, inBeam, secure) {
+  var x = gapX[i], y = WALL_Y + 6, h = WALL_H - 12, st = gapState[i];
+  if (!inBeam && st === 0) return;
+  ctx.fillStyle = st === 1 ? '#ffe9a8' : (st === 2 ? '#3a0a10' : (secure ? '#9a7430' : '#04050a'));
+  ctx.fillRect(x - 9, y, 18, h);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = st === 2 ? '#ff5a5a' : (st === 1 || secure ? '#fff6d0' : '#ffd37a');
+  ctx.strokeRect(x - 9, y, 18, h);
+  if (gapTick[i] > 0) {                         // "locked on" ring when the crack enters the cover zone
+    var a = gapTick[i] / 0.25;
+    ctx.globalAlpha = a; ctx.strokeStyle = '#fff6d0';
+    ctx.strokeRect(x - 13 - (1 - a) * 8, y - 4 - (1 - a) * 8, 26 + (1 - a) * 16, h + 8 + (1 - a) * 16);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawFrame() {
+  var i, x, y, a;
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.drawImage(bgSpr, 0, 0);
+
+  ctx.save();
+  if (shakeT > 0) ctx.translate((rnd() - 0.5) * 8 * shakeT, (rnd() - 0.5) * 6 * shakeT);
+
+  // keep bricks (8 pips = the keep's health)
+  for (i = 0; i < MAX_BRICKS; i++) {
+    x = 141 + (i & 3) * 28; y = 306 + (i >> 2) * 22;
+    if (i < bricks) { ctx.fillStyle = '#8c6a46'; ctx.fillRect(x, y, 24, 16); ctx.fillStyle = '#b58d5c'; ctx.fillRect(x, y, 24, 3); }
+    else {
+      ctx.strokeStyle = '#5a3a3a'; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, 23, 15);
+      if (i === bricks && brokenT > 0) { ctx.globalAlpha = brokenT > 1 ? 1 : brokenT; ctx.fillStyle = '#ff5a5a'; ctx.fillRect(x, y, 24, 16); ctx.globalAlpha = 1; }
+    }
+  }
+
+  // wall: dark; moonlit during preview; warm lit slice around the beam
+  ctx.drawImage(wallDark, 0, WALL_Y);
+  var moonA = 0;
+  if (phase === PH_PREVIEW) {
+    moonA = Math.min(1, phT / 0.2, (phDur - phT) / 0.4);
+    if (moonA < 0) moonA = 0;
+    ctx.globalAlpha = moonA;
+    ctx.drawImage(wallMoon, 0, WALL_Y);
+    ctx.globalAlpha = 1;
+  }
+  var sx = beamX - BEAM_HALF; if (sx < 0) sx = 0;
+  var sw = BEAM_HALF * 2; if (sx + sw > W) sw = W - sx;
+  ctx.drawImage(wallWarm, sx, 0, sw, WALL_H, sx, WALL_Y, sw, WALL_H);
+
+  // gap marks: all visible in moonlight, otherwise only inside the beam
+  for (i = 0; i < gapN; i++) {
+    var d = gapX[i] - beamX; if (d < 0) d = -d;
+    var inBeam = d <= BEAM_HALF;
+    if (phase === PH_PREVIEW) {
+      if (moonA > 0) {
+        ctx.globalAlpha = moonA;
+        ctx.fillStyle = 'rgba(159,208,255,0.35)';
+        ctx.fillRect(gapX[i] - 15, WALL_Y + 2, 30, WALL_H - 4);
+        ctx.fillStyle = '#04050a';
+        ctx.fillRect(gapX[i] - 9, WALL_Y + 6, 18, WALL_H - 12);
+        ctx.lineWidth = 2; ctx.strokeStyle = '#bfe3ff';
+        ctx.strokeRect(gapX[i] - 9, WALL_Y + 6, 18, WALL_H - 12);
+        ctx.globalAlpha = 1;
+      }
+    } else {
+      drawGap(i, inBeam, d <= COVER_HALF);
+    }
+    // resolve flash
+    if (gapFlash[i] > 0) {
+      a = gapFlash[i] / 0.6;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = gapState[i] === 1 ? '#fff2b8' : '#ff4040';
+      ctx.beginPath(); ctx.arc(gapX[i], WALL_Y + WALL_H / 2, 14 + (1 - a) * 26, 0, 6.2832); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // shadows (dim in the dark, bright inside the beam)
+  if (phase === PH_RUSH) {
+    for (i = 0; i < shN; i++) {
+      if (shState[i] !== 1) continue;
+      var t = (rushT - shSpawn[i]) / travel; if (t > 1) t = 1;
+      var gx = gapX[shGap[i]];
+      x = shX0[i] + (gx - shX0[i]) * t;
+      y = 180 + (WALL_Y + WALL_H / 2 - 180) * (t * (0.4 + 0.6 * t));
+      var dx = x - beamX; if (dx < 0) dx = -dx;
+      var lit = dx <= BEAM_HALF + 8 && y > WALL_Y - 70;
+      ctx.globalAlpha = lit ? 1 : 0.28;
+      ctx.fillStyle = lit ? '#2b1236' : '#000';
+      ctx.beginPath(); ctx.arc(x, y, 15, 0, 6.2832); ctx.fill();
+      ctx.fillRect(x - 15, y, 30, 8);
+      ctx.fillStyle = '#ff5a6a';
+      ctx.fillRect(x - 7, y - 4, 4, 4); ctx.fillRect(x + 3, y - 4, 4, 4);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // beam + lantern
+  ctx.globalAlpha = dragging ? 1 : 0.8;
+  ctx.drawImage(coneSpr, beamX - BEAM_HALF, WALL_Y + WALL_H);
+  ctx.globalAlpha = 1;
+  // beam centre tick on the wall (shows where the cover zone is centred)
+  ctx.fillStyle = '#fff2b8';
+  ctx.fillRect(beamX - 1.5, WALL_Y - 8, 3, 8);
+  // steer rail under the lantern + drag cues
+  ctx.globalAlpha = dragging ? 0.6 : 0.25;
+  ctx.fillStyle = '#ffd37a';
+  ctx.fillRect(BEAM_MIN, LANTERN_Y + 34, BEAM_MAX - BEAM_MIN, 4);
+  ctx.globalAlpha = 1;
+  if (!hasDragged) {                            // pulsing arrows until the first drag
+    var ao = Math.sin(time * 6) * 5;
+    ctx.fillStyle = '#ffe9a8';
+    ctx.beginPath(); ctx.moveTo(beamX - 44 - ao, LANTERN_Y); ctx.lineTo(beamX - 32 - ao, LANTERN_Y - 10); ctx.lineTo(beamX - 32 - ao, LANTERN_Y + 10); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(beamX + 44 + ao, LANTERN_Y); ctx.lineTo(beamX + 32 + ao, LANTERN_Y - 10); ctx.lineTo(beamX + 32 + ao, LANTERN_Y + 10); ctx.fill();
+  }
+  if (dragging) {                               // grip ring while held
+    ctx.strokeStyle = '#ffe9a8'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(beamX, LANTERN_Y, 30, 0, 6.2832); ctx.stroke();
+  }
+  if (ringT > 0) {                              // tap ripple
+    a = ringT / 0.35;
+    ctx.globalAlpha = a; ctx.strokeStyle = '#fff6d0'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(targetX, LANTERN_Y, 20 + (1 - a) * 40, 0, 6.2832); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  ctx.drawImage(glowSpr, beamX - 60, LANTERN_Y - 60);
+  ctx.fillStyle = '#3b2a18'; ctx.fillRect(beamX - 9, LANTERN_Y - 12, 18, 26);
+  ctx.fillStyle = '#ffe9a8'; ctx.fillRect(beamX - 6, LANTERN_Y - 8, 12, 16);
+  ctx.fillStyle = '#5a4026'; ctx.fillRect(beamX - 11, LANTERN_Y - 15, 22, 4);
+
+  // particles
+  for (i = 0; i < MAX_PART; i++) {
+    if (pLife[i] <= 0) continue;
+    ctx.globalAlpha = pLife[i] > 0.4 ? 1 : pLife[i] / 0.4;
+    ctx.fillStyle = pKind[i] === 0 ? '#fff0b0' : '#b0203a';
+    ctx.fillRect(pX[i] - 2, pY[i] - 2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // miss = red vignette flash, cover = soft gold flash
+  if (missFlash > 0) {
+    ctx.globalAlpha = missFlash > 0.4 ? 0.4 : missFlash;
+    ctx.fillStyle = '#ff2a3a';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  } else if (goodFlash > 0) {
+    ctx.globalAlpha = goodFlash * 0.4;
+    ctx.fillStyle = '#ffe9a8';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  drawHud();
+}
+
+function drawHud() {
+  var i;
+  if (shownScore !== score) { shownScore = score; scoreStr = 'Score ' + score; }
+  if (shownBest !== best) { shownBest = best; bestStr = 'Best ' + best; }
+  if (shownNight !== night) { shownNight = night; nightStr = 'Night ' + night + '/' + NIGHTS; }
+
+  if (shownBricks !== bricks) { shownBricks = bricks; brickStr = 'Keep ' + bricks + '/' + MAX_BRICKS; }
+
+  ctx.font = 'bold 18px system-ui, sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left'; ctx.fillStyle = '#e6ecff'; ctx.fillText(scoreStr, 14, 30);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#b4bfe6'; ctx.fillText(bestStr, W - 14, 30);
+  ctx.textAlign = 'center'; ctx.fillStyle = '#ffd37a'; ctx.fillText(nightStr, W / 2, 30);
+
+  // restart button (two-tap: arm, then confirm)
+  var armed = armT > 0;
+  ctx.fillStyle = armed ? '#6a2a2a' : 'rgba(255,255,255,0.10)';
+  ctx.fillRect(RB_X, RB_Y, armed ? RB_ARM_W : RB_W, RB_H);
+  ctx.strokeStyle = armed ? '#ff7a7a' : '#6c78a0'; ctx.lineWidth = 2;
+  ctx.strokeRect(RB_X + 1, RB_Y + 1, (armed ? RB_ARM_W : RB_W) - 2, RB_H - 2);
+  if (armed) {
+    ctx.font = 'bold 14px system-ui, sans-serif'; ctx.fillStyle = '#ffd0d0';
+    ctx.fillText('Tap to restart', RB_X + RB_ARM_W / 2, RB_Y + 29);
+  } else {
+    ctx.strokeStyle = '#e6ecff'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(RB_X + RB_W / 2, RB_Y + RB_H / 2, 11, 0.6, 5.6); ctx.stroke();
+    ctx.fillStyle = '#e6ecff';
+    ctx.beginPath(); ctx.moveTo(RB_X + RB_W / 2 + 14, RB_Y + RB_H / 2 - 12); ctx.lineTo(RB_X + RB_W / 2 + 14, RB_Y + RB_H / 2 + 1); ctx.lineTo(RB_X + RB_W / 2 + 3, RB_Y + RB_H / 2 - 4); ctx.fill();
+  }
+
+  // keep health label
+  ctx.font = 'bold 14px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = brokenT > 0 ? '#ff7a7a' : '#d9c29a';
+  ctx.fillText(brickStr, 195, 268);
+
+  // Recall streak
+  ctx.font = 'bold 13px system-ui, sans-serif';
+  ctx.fillStyle = '#a4aed4';
+  ctx.fillText('RECALL', W / 2, 62);
+  var sc = 1 + (streakPulse > 0 ? streakPulse * 1.2 : 0);
+  ctx.save();
+  ctx.translate(W / 2, 104);
+  ctx.scale(sc, sc);
+  ctx.font = 'bold 42px system-ui, sans-serif';
+  ctx.fillStyle = brokenT > 0 && ((brokenT * 10) | 0) % 2 ? '#ff5a5a' : STREAK_COL[streak];
+  ctx.fillText(STREAK_TEXT[streak], 0, 0);
+  ctx.restore();
+  if (brokenT > 0) {
+    ctx.font = 'bold 14px system-ui, sans-serif';
+    ctx.fillStyle = '#ff7a7a'; ctx.fillText('STREAK BROKEN', W / 2, 124);
+  } else {
+    for (i = 1; i <= MAX_STREAK; i++) {
+      ctx.fillStyle = i <= streak ? STREAK_COL[streak] : '#252a40';
+      ctx.fillRect(W / 2 - 45 + (i - 1) * 20, 114, 14, 6);
+    }
+  }
+
+  // prompt + timer
+  ctx.font = 'bold 16px system-ui, sans-serif';
+  var msg = '';
+  var frac = -1;
+  if (phase === PH_PREVIEW) { msg = 'Moonlight: memorize the cracks'; frac = 1 - phT / phDur; }
+  else if (phase === PH_PLAN) { msg = 'Drag the lantern over the cracks'; frac = 1 - phT / phDur; }
+  else if (phase === PH_RUSH) { msg = 'Shadows rush in. Hold the light!'; }
+  else if (phase === PH_REST) { msg = restStr; }
+  ctx.fillStyle = '#cfd8ff';
+  if (msg) ctx.fillText(msg, W / 2, 152);
+  if (frac >= 0) {
+    ctx.fillStyle = '#1b2036'; ctx.fillRect(W / 2 - 80, 160, 160, 6);
+    ctx.fillStyle = phase === PH_PREVIEW ? '#9fd0ff' : (frac < 0.25 ? '#ff9a6a' : '#ffd37a');
+    ctx.fillRect(W / 2 - 80, 160, 160 * (frac < 0 ? 0 : frac), 6);
+  }
+  // goal line
+  if (phase !== PH_OVER) {
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillStyle = '#9aa6cf';
+    ctx.fillText('Goal: light every crack before its shadow lands', W / 2, 188);
+  }
+
+  // night banner
+  if (bannerT > 0 && phase !== PH_OVER) {
+    var ba = bannerT / BANNER_DUR;              // 1 -> 0
+    var al = ba > 0.85 ? (1 - ba) / 0.15 : (ba < 0.25 ? ba / 0.25 : 1);
+    var bs = 1 + (ba > 0.85 ? (0.85 - ba) * 2 : 0) + 0; if (bs < 0.7) bs = 0.7;
+    ctx.globalAlpha = al * 0.9;
+    ctx.fillStyle = '#04050a';
+    ctx.fillRect(0, 218, W, 84);
+    ctx.globalAlpha = al;
+    ctx.save();
+    ctx.translate(W / 2, 262); ctx.scale(bs, bs);
+    ctx.font = 'bold 36px system-ui, sans-serif';
+    ctx.fillStyle = phase === PH_REST && perfectFlag ? '#ffe27a' : '#ffd37a';
+    ctx.fillText(bannerStr, 0, 0);
+    ctx.restore();
+    ctx.font = '15px system-ui, sans-serif';
+    ctx.fillStyle = '#cfd8ff';
+    ctx.fillText(bannerSub, W / 2, 288);
+    ctx.globalAlpha = 1;
+  }
+
+  // score pops
+  ctx.font = 'bold 20px system-ui, sans-serif';
+  for (i = 0; i < MAX_POP; i++) {
+    if (popLife[i] <= 0) continue;
+    ctx.globalAlpha = popLife[i] > 0.4 ? 1 : popLife[i] / 0.4;
+    ctx.fillStyle = popTxt[i] === 5 ? '#ff7a7a' : '#fff2b8';
+    ctx.fillText(POP_TEXT[popTxt[i]], popX[i], popY[i]);
+  }
+  ctx.globalAlpha = 1;
+
+  // control zone hint
+  if (phase !== PH_OVER) {
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillStyle = '#8590b8';
+    ctx.fillText('< drag anywhere here to steer the lantern >', W / 2, 790);
+  }
+
+  if (phase === PH_OVER) drawOver();
+}
+
+function drawOver() {
+  ctx.fillStyle = 'rgba(2,3,8,0.78)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 30px system-ui, sans-serif';
+  ctx.fillStyle = won ? '#ffe27a' : '#ff7a7a';
+  ctx.fillText(won ? 'Dawn breaks!' : 'The keep has fallen', W / 2, 320);
+  ctx.font = '16px system-ui, sans-serif';
+  ctx.fillStyle = '#cfd8ff';
+  ctx.fillText(won ? 'The lantern held through all nights' : 'The shadows stole every brick', W / 2, 352);
+  ctx.font = 'bold 34px system-ui, sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(overScoreStr, W / 2, 420);
+  ctx.font = '18px system-ui, sans-serif';
+  ctx.fillStyle = newBest ? '#ffd37a' : '#9aa6cf';
+  ctx.fillText(overBestStr, W / 2, 452);
+  ctx.fillStyle = overT > 0.6 ? '#ffd37a' : '#5a5030';
+  ctx.fillRect(W / 2 - 100, 496, 200, 60);
+  ctx.fillStyle = '#1a1208';
+  ctx.font = 'bold 22px system-ui, sans-serif';
+  ctx.fillText('Defend again', W / 2, 534);
+  ctx.font = '13px system-ui, sans-serif';
+  ctx.fillStyle = '#9aa6cf';
+  ctx.fillText('Tap anywhere to restart', W / 2, 586);
+}
+
+// ---------------------------------------------------------------- main loop (fixed-step accumulator)
+var acc = 0, last = 0;
+function frame(ts) {
+  if (!last) last = ts;
+  var d = (ts - last) / 1000; last = ts;
+  if (d > 0.25) d = 0.25;
+  if (d < 0) d = 0;
+  acc += d;
+  while (acc >= STEP) { step(STEP); acc -= STEP; }
+  drawFrame();
+  requestAnimationFrame(frame);
+}
+
+newGame();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
