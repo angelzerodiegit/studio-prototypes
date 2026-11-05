@@ -1,0 +1,15 @@
+{
+  "files": [
+    {"path": "sprites/heroes.png", "purpose": "five adult hero sprites in evenly sliced 128x192 cells", "size": "640x192"},
+    {"path": "sprites/enemies.png", "purpose": "grunt, fast and tank enemy sprites in 128x128 cells", "size": "384x128"},
+    {"path": "sprites/icons.png", "purpose": "rivalry, stun and breach HUD icons in 64x64 cells", "size": "192x64"},
+    {"path": "ui/hud-mock.png", "purpose": "portrait HUD mock showing active rivalry gameplay", "size": "390x844"}
+  ],
+  "style": "Polished original vertical-comic characters with plum ink, cream highlights and jewel-tone tailoring. The salon-street HUD uses rose velvet, restrained gold trim and high-contrast live text.",
+  "integration": [
+    "Slice sprites/heroes.png into five 128x192 cells, enemies.png into three 128x128 cells, and icons.png into three 64x64 cells.",
+    "Use live text for score and xN chain; place the three breach-heart icons inside the top safe area as shown in ui/hud-mock.png.",
+    "Place each hero in a touch slot at least 44 px wide and map slots 1-2 to left, 3 to centre, and 4-5 to right.",
+    "For idle hide pair effects; for rivalry show the first icon with a rose-gold glow; for stun show the second icon and mute both heroes; for game over add an opaque cream-and-plum results panel above the dimmed battlefield."
+  ]
+}
