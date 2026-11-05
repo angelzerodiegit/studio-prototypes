@@ -1,0 +1,30 @@
+{
+  "files": [
+    {
+      "path": "sprites/hero.png",
+      "purpose": "adult heroine sprite in an elegant summer dress-suit, with five-petal hat and parasol handle",
+      "size": "256x256 RGBA PNG"
+    },
+    {
+      "path": "sprites/parasol.png",
+      "purpose": "separate lace parasol canopy for code-driven rotation around the bottom-center pivot",
+      "size": "192x96 RGBA PNG"
+    },
+    {
+      "path": "sprites/archer.png",
+      "purpose": "adult rival archer sprite, front-facing while drawing a bow",
+      "size": "128x128 RGBA PNG"
+    },
+    {
+      "path": "ui/hud-mock.png",
+      "purpose": "opaque portrait gameplay/HUD mock with safe top HUD, five-petal health, archers, heroine, gate and lower drag zone",
+      "size": "390x844 RGB PNG"
+    }
+  ],
+  "style": "Original polished vertical-comic linework with soft cel shading, cream-and-rose fashion accents, plum ink and a breezy pastel summer arena. Adult characters are glamorous and fully clothed, with allure conveyed through tailoring, poise and expression.",
+  "integration": [
+    "Load sprites/hero.png and sprites/archer.png as transparent character sprites at their authored aspect ratios.",
+    "Rotate sprites/parasol.png around its bottom-center pivot and position it independently above the heroine's hands.",
+    "Use ui/hud-mock.png as the 390x844 composition reference for safe-area HUD placement, five-petal health, multiplier, score and lower drag zone."
+  ]
+}
