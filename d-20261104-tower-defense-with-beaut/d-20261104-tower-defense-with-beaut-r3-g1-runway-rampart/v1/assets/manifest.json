@@ -1,0 +1,33 @@
+{
+  "files": [
+    {
+      "path": "sprites/heroine.png",
+      "purpose": "Three-cell heroine outfit sprite sheet: Frost Gown, Flame Dress, Spark Suit",
+      "size": "768x256"
+    },
+    {
+      "path": "sprites/enemies.png",
+      "purpose": "Three-cell mannequin invader sprite sheet: flame-weak, frost-weak, spark-weak",
+      "size": "384x128"
+    },
+    {
+      "path": "sprites/icons.png",
+      "purpose": "Four-cell HUD icon strip: flame, frost, spark, heart",
+      "size": "256x64"
+    },
+    {
+      "path": "ui/hud-mock.png",
+      "purpose": "390x844 portrait gameplay and HUD layout reference",
+      "size": "390x844"
+    }
+  ],
+  "style": "Polished original vertical-comic linework with soft cel shading, plum contours, cream runway surfaces, and glamorous jewel-tone couture. Refined rose-gold HUD trim keeps gameplay readable over the boutique scene.",
+  "integration": [
+    "Slice sprites/heroine.png into three 256x256 cells in order: Frost Gown, Flame Dress, Spark Suit.",
+    "Slice sprites/enemies.png into three 128x128 cells in order: flame-weak, frost-weak, spark-weak.",
+    "Slice sprites/icons.png into four 64x64 cells in order: flame, frost, spark, heart.",
+    "Use ui/hud-mock.png as the 390x844 layout reference: score left, Style Streak centered, three hearts right, heroine lower-middle, and three outfit buttons in the lower-third thumb zone.",
+    "For idle, show the selected outfit at rest; for a correct match, pop the Style Streak badge and selection glow; for a wrong match, reset the badge to x1 and remove one heart; for game over, dim gameplay and place a centered restart panel without moving the lower controls.",
+    "Apply the weakness cycle exactly: Frost Gown beats flame, Spark Suit beats frost, and Flame Dress beats spark. Keep each outfit button at least 56 px and all critical HUD content inside mobile safe areas."
+  ]
+}
