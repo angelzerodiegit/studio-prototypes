@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <title>Fold Fortress</title>
+  <link rel="stylesheet" href="assets/ui/hud.css">
+</head>
+<body>
+  <main id="game-shell" aria-label="Fold Fortress game">
+    <canvas id="game" width="390" height="844" aria-label="Paper battlefield"></canvas>
+    <section id="hud" aria-label="Game status">
+      <div class="hud-stat hud-score"><span class="eyebrow">SCORE</span><strong id="score">0000</strong></div>
+      <div id="combo" class="combo" aria-live="polite"><span>CREASE</span><strong>x1</strong></div>
+      <div class="hud-stat hud-folds"><span class="eyebrow">FOLDS</span><strong id="folds">10</strong></div>
+      <div class="health-wrap">
+        <div class="health-label"><span>CASTLE</span><span id="health-text">3 / 3</span></div>
+        <div class="health-track"><div id="health-fill" class="health-fill"></div></div>
+      </div>
+    </section>
+
+    <section id="game-over" class="panel" aria-labelledby="over-title">
+      <div class="paper-card game-over-card">
+        <p class="kicker" id="over-kicker">THE MAP IS LOST</p>
+        <h2 id="over-title">GAME OVER</h2>
+        <div class="final-score"><span>FINAL SCORE</span><strong id="final-score">0000</strong></div>
+        <button id="restart-button" type="button">FOLD AGAIN</button>
+      </div>
+    </section>
+
+    <div id="toast" aria-live="polite">x2 CREASE</div>
+  </main>
+  <script src="game.js"></script>
+</body>
+</html>

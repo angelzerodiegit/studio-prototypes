@@ -1,0 +1,22 @@
+{
+  "files": [
+    {"path": "art/castle.png", "purpose": "paper castle base sprite, front view", "size": "96x96"},
+    {"path": "art/soldier.png", "purpose": "paper stick soldier walking downward", "size": "32x40"},
+    {"path": "art/soldier-flat.png", "purpose": "flattened soldier after a successful fold", "size": "32x16"},
+    {"path": "art/paper.png", "purpose": "opaque cream paper map texture with faint grid", "size": "390x844"},
+    {"path": "art/crease-glow.png", "purpose": "horizontal crease highlight, rotated in code for vertical folds", "size": "390x16"},
+    {"path": "art/spark.png", "purpose": "paper-confetti impact spark", "size": "24x24"},
+    {"path": "ui/index.html", "purpose": "offline portrait prototype entry point and start/game-over states"},
+    {"path": "ui/hud.css", "purpose": "responsive 390x844 HUD, panels, safe-area spacing, and touch controls"},
+    {"path": "ui/game.js", "purpose": "fixed-step fold-defense prototype with pooled soldiers and sparks"},
+    {"path": "ui/hud-mock.png", "purpose": "390x844 playing-state HUD mock over a gameplay scene", "size": "390x844"}
+  ],
+  "style": "Flat papercraft on warm cream map stock, with slate ink, terracotta fold accents, moss health, restrained shadows, and faint map-grid texture. Chunky paper silhouettes and high-contrast live HUD text stay readable at phone scale.",
+  "integration": [
+    "Open ui/index.html as the offline prototype entry point; it loads only local files.",
+    "Keep the art folder beside ui so game.js paths such as ../art/castle.png continue to resolve.",
+    "If integrating into another shell, update #score, #combo strong, #folds, #health-text, #health-fill, and #final-score from game state.",
+    "Pointer input must begin within 48 canvas pixels of the current sheet edge; a 38-pixel inward drag commits a snapped fold.",
+    "Preserve the 390x844 canvas coordinate system and scale the containing #game-shell uniformly for portrait screens."
+  ]
+}
